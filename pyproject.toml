@@ -18,6 +18,7 @@ dependencies = [
     "zephyr",
     # top level deps. try to keep these small.
     "watchdog",
+    "tensorboard>=2.20.0",
 ]
 
 [tool.uv]

@@ -1,0 +1,181 @@
+#####################################################
+#   LOCAL OVERRIDE FOR EXISTING BIGNODE TPU SLICE   #
+#  Derived from infra/marin-us-east1.yaml; do not   #
+#  regenerate via update-configs or commit as a     #
+#  shared cluster definition.                       #
+#####################################################
+cluster_name: marin-bignode
+max_workers: 1024
+
+auth:
+  ssh_private_key: ~/.ssh/google_compute_engine
+  ssh_public_key: ~/.ssh/google_compute_engine.pub
+  ssh_user: neel
+
+provider:
+  type: gcp
+  region: us-east1
+  availability_zone: us-east1-d
+  project_id: asura-0
+
+docker:
+  image: "ghcr.io/marin-community/marin-cluster:latest"
+  container_name: "ray_docker"
+  pull_before_run: true
+  worker_run_options:
+    - --restart=on-failure
+    - --rm=0
+    - --privileged
+    - --ulimit memlock=-1:-1
+    - --ulimit nofile=1048576:1048576
+    - --shm-size=100gb
+    - -v
+    - "/tmp:/tmp"
+    - -e MARIN_PREFIX=gs://marin-bucket
+    - -e BUCKET=marin-bucket
+    - -e MARIN_LOCAL_CACHE_DIR=/tmp/marin-cache
+    - -e AUTOSCALER_HEARTBEAT_TIMEOUT_S=600
+    - -e TPU_MIN_LOG_LEVEL=3
+    - -e TPU_STDERR_LOG_LEVEL=3
+    - -e TPU_LOG_DIR=disabled
+    - -e LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=81920 --xla_enable_async_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
+    - -v "/var/run/docker.sock:/var/run/docker.sock"
+    - -e RAY_AUTH_MODE=token
+    - -e RAY_AUTH_TOKEN_PATH=/home/ray/.ray/auth_token
+  head_run_options:
+    - --privileged
+    - -v "/tmp:/tmp"
+    - --ulimit nofile=1048576:1048576
+    - -e RAY_TPU_MAX_CONCURRENT_ACTIVE_CONNECTIONS=64
+    - -e MARIN_PREFIX=gs://marin-bucket
+    - -e BUCKET=marin-bucket
+    - -e MARIN_LOCAL_CACHE_DIR=/tmp/marin-cache
+    - -e AUTOSCALER_HEARTBEAT_TIMEOUT_S=600
+    - -e TPU_MIN_LOG_LEVEL=3
+    - -e TPU_STDERR_LOG_LEVEL=3
+    - -e TPU_LOG_DIR=disabled
+    - -e LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=81920 --xla_enable_async_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
+    - -e RAY_AUTH_MODE=token
+    - -e RAY_AUTH_TOKEN_PATH=/home/ray/.ray/auth_token
+
+initialization_commands:
+  - which docker || (curl -fsSL https://get.docker.com -o get-docker.sh; sudo sh get-docker.sh; sudo usermod -aG docker $USER; sudo systemctl restart docker -f)
+  - sudo usermod -aG docker $USER
+  - sudo chmod 666 /var/run/docker.sock
+
+setup_commands:
+  - gcloud config set project asura-0
+  - gcloud config set compute/region us-east1
+  - gcloud config set compute/zone us-east1-d
+  - mkdir -p $HOME/.ssh && gcloud compute project-info describe --project=asura-0 --format="value(commonInstanceMetadata.items[?key==\"ssh-keys\"].value)" > $HOME/.ssh/authorized_keys && chmod 600 $HOME/.ssh/authorized_keys
+  - gcloud secrets versions access latest --project=asura-0 --secret=RAY_CLUSTER_PUBLIC_KEY > $HOME/.ssh/google_compute_engine.pub
+  - chmod 600 $HOME/.ssh/google_compute_engine.pub
+  - mkdir -p $HOME/.ray
+  - gcloud secrets versions access latest --project=asura-0 --secret=RAY_AUTH_TOKEN > $HOME/.ray/auth_token
+  - chmod 600 $HOME/.ray/auth_token
+  - mkdir -p /tmp/marin-cache
+  - uv pip install --python /opt/levanter/.venv/bin/python pip
+
+worker_setup_commands:
+  - rm -rf /tmp/ray/session_*/runtime_resources/
+
+head_node_type: head_default
+
+available_node_types:
+  head_default:
+    min_workers: 0
+    max_workers: 0
+    resources: {"CPU": 8, "head_node": 1}
+    node_config:
+      machineType: n2-standard-8
+      disks:
+        - boot: true
+          autoDelete: true
+          type: PERSISTENT
+          initializeParams:
+            diskSizeGb: 100
+            sourceImage: projects/ubuntu-os-cloud/global/images/family/ubuntu-2204-lts
+
+  tpu_worker:
+    max_workers: 96
+    min_workers: 0
+    node_config:
+      acceleratorType: v6e-4
+      runtimeVersion: v2-alpha-tpuv6e
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+
+  tpu_slice_v6e_8:
+    max_workers: 48
+    min_workers: 0
+    node_config:
+      acceleratorType: v6e-8
+      runtimeVersion: v2-alpha-tpuv6e
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 8
+
+  tpu_slice_v6e_16:
+    max_workers: 96
+    min_workers: 0
+    node_config:
+      acceleratorType: v6e-16
+      runtimeVersion: v2-alpha-tpuv6e
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+
+  tpu_slice_v6e_32:
+    max_workers: 96
+    min_workers: 0
+    node_config:
+      acceleratorType: v6e-32
+      runtimeVersion: v2-alpha-tpuv6e
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+
+  tpu_slice_v6e_64:
+    max_workers: 96
+    min_workers: 0
+    node_config:
+      acceleratorType: v6e-64
+      runtimeVersion: v2-alpha-tpuv6e
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+
+  tpu_slice_v6e_128:
+    max_workers: 96
+    min_workers: 0
+    node_config:
+      acceleratorType: v6e-128
+      runtimeVersion: v2-alpha-tpuv6e
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4
+
+  tpu_slice_v6e_256:
+    max_workers: 64
+    min_workers: 0
+    node_config:
+      acceleratorType: v6e-256
+      runtimeVersion: v2-alpha-tpuv6e
+      schedulingConfig:
+        preemptible: true
+    resources:
+      CPU: 120
+      TPU: 4

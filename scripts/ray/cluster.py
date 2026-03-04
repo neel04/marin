@@ -25,7 +25,6 @@ from typing import Any
 
 import click
 import yaml
-
 from fray.v1.cluster.ray.auth import ray_auth_secret
 from fray.v1.cluster.ray.dashboard import DashboardConfig, ray_dashboard
 from marin.cluster import gcp
@@ -46,9 +45,40 @@ TPU_TYPE_TO_VM_IMAGE = {
 logger = logging.getLogger(__name__)
 
 
+def _env_value(run_options: list[str], name: str) -> str | None:
+    """Extract `NAME=value` from docker run options."""
+    prefix = f"{name}="
+    for option in run_options:
+        if option.startswith("-e "):
+            env = option[3:]
+            if env.startswith(prefix):
+                return env[len(prefix) :]
+    return None
+
+
+def _copy_to_manual_worker(tpu_name: str, zone: str, *paths: str) -> None:
+    """Copy bootstrap files to a manual TPU worker."""
+    subprocess.check_call(
+        [
+            "gcloud",
+            "compute",
+            "tpus",
+            "tpu-vm",
+            "scp",
+            "--worker=all",
+            f"--zone={zone}",
+            *paths,
+            f"{tpu_name}:/tmp/",
+        ]
+    )
+
+
 def _list_jobs(filters: list[str] | None = None) -> list[dict]:
     """Fetch the list of jobs using the Ray CLI."""
     cmd = ["ray", "list", "jobs", "--detail", "--format=json", "--limit=10000"]
+    ray_address = os.environ.get("RAY_ADDRESS")
+    if ray_address:
+        cmd.extend(["--address", ray_address])
     for f in filters or []:
         cmd.extend(["--filter", f])
 
@@ -241,8 +271,7 @@ def _initialize_manual_worker(config_file: str, tpu_name: str) -> None:
     cluster_name = cluster_config["cluster_name"]
     docker_container_name = cluster_config["docker"]["container_name"]
     docker_image = cluster_config["docker"]["image"]
-    region = cluster_config["provider"]["region"]
-    bucket = f"marin-{region}"
+    bucket = _env_value(worker_run_options, "BUCKET")
 
     print(f"Initializing Ray on worker {tpu_name}...")
     print(f"Zone: {zone}")
@@ -251,12 +280,13 @@ def _initialize_manual_worker(config_file: str, tpu_name: str) -> None:
     print(f"Docker image: {docker_image}")
 
     setup_commands = "\n".join(setup_commands)
+    bucket_export = f'export BUCKET="{bucket}"' if bucket else ""
 
     entry_script_content = f"""#!/bin/bash
 set -x
 set -eo pipefail
 
-export BUCKET="{bucket}"
+{bucket_export}
 
 {setup_commands}
 
@@ -294,20 +324,7 @@ sleep 10
 
         entry_sh.flush()
         init_sh.flush()
-        run_command(
-            *[
-                "gcloud",
-                "compute",
-                "tpus",
-                "tpu-vm",
-                "scp",
-                "--worker=all",
-                f"--zone={zone}",
-                entry_sh.name,
-                init_sh.name,
-                f"{tpu_name}:/tmp/",
-            ]
-        )
+        _copy_to_manual_worker(tpu_name, zone, entry_sh.name, init_sh.name)
         entry_name = os.path.basename(entry_sh.name)
         init_name = os.path.basename(init_sh.name)
         tpu_ssh(

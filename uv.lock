@@ -5335,6 +5335,7 @@ dependencies = [
     { name = "iris" },
     { name = "levanter" },
     { name = "marin" },
+    { name = "tensorboard" },
     { name = "watchdog" },
     { name = "zephyr" },
 ]
@@ -5346,6 +5347,7 @@ requires-dist = [
     { name = "iris", editable = "lib/iris" },
     { name = "levanter", editable = "lib/levanter" },
     { name = "marin", editable = "lib/marin" },
+    { name = "tensorboard", specifier = ">=2.20.0" },
     { name = "watchdog" },
     { name = "zephyr", editable = "lib/zephyr" },
 ]

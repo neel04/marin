@@ -42,4 +42,4 @@ jobs:
           project_id: ${{ secrets.GCP_PROJECT_ID }}
 
       - name: Cleanup preempted and terminated TPUs
-        run: uv run python scripts/ray/cleanup_workers.py --threshold=0
+        run: uv run python scripts/ray/cleanup_workers.py --project "${{ secrets.GCP_PROJECT_ID }}" --threshold=0

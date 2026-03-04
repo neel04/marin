@@ -29,6 +29,7 @@
 - Always use `uv run` for Python entry points. If that fails, try `.venv/bin/python` directly.
 - Run `./infra/pre-commit.py --all-files` before sending changes; formatting and linting are enforced with `ruff`.
 - Keep type hints passing under `uv run pyrefly`; configuration lives in `pyproject.toml`.
+- Make minimum code changes; remove fluff when necessary
 
 ### Communication & Commits
 
@@ -118,3 +119,4 @@ DO NOT:
 ## Environment
 
 - Prefer to use `uv` when possible. If you can't (for instance, due to sandbox restrictions) you can use `.venv/bin/python`
+- For local TPU/Ray bootstrap in this workspace, use the GCP project `asura-0`. Do not assume access to `hai-gcp-models` when editing one-off cluster configs or bootstrap steps.

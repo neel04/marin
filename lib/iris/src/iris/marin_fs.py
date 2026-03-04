@@ -118,12 +118,17 @@ def marin_region() -> str | None:
 def marin_temp_bucket(ttl_days: int, prefix: str = "") -> str:
     """Return a path on region-local temp storage. Never returns ``None``.
 
-    For a GCS marin prefix with a known region, returns a path on the
-    dedicated temp bucket::
+    When ``MARIN_PREFIX`` is explicitly set, temp storage stays under that
+    prefix::
+
+        {marin_prefix}/tmp/{prefix}
+
+    Otherwise, for a GCS marin prefix with a known region, returns a path on
+    the dedicated temp bucket::
 
         gs://marin-tmp-{region}/ttl={N}d/{prefix}
 
-    Otherwise falls back to a flat path under the marin prefix::
+    Finally, falls back to a flat path under the marin prefix::
 
         {marin_prefix}/tmp/{prefix}
 
@@ -138,15 +143,18 @@ def marin_temp_bucket(ttl_days: int, prefix: str = "") -> str:
     """
     mp = marin_prefix()
 
-    if mp.startswith("gs://"):
+    if os.environ.get("MARIN_PREFIX"):
+        region = None
+    else:
         region = marin_region()
-        if region:
-            bucket = REGION_TO_TMP_BUCKET.get(region)
-            if bucket:
-                path = f"gs://{bucket}/ttl={ttl_days}d"
-                if prefix:
-                    path = f"{path}/{prefix.strip('/')}"
-                return path
+
+    if mp.startswith("gs://") and region:
+        bucket = REGION_TO_TMP_BUCKET.get(region)
+        if bucket:
+            path = f"gs://{bucket}/ttl={ttl_days}d"
+            if prefix:
+                path = f"{path}/{prefix.strip('/')}"
+            return path
 
     if "://" not in mp:
         mp = f"file://{mp}"

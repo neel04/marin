@@ -139,6 +139,9 @@ def load_cluster_info(config_path: str) -> ClusterInfo:
     cluster_name = config["cluster_name"]
     zone = config["provider"]["availability_zone"]
     project = config["provider"].get("project_id", "")
+    auth = config.get("auth", {})
+    ssh_user = auth.get("ssh_user", "ray")
+    ssh_private_key = os.path.expanduser(auth.get("ssh_private_key", "~/.ssh/marin_ray_cluster.pem"))
 
     # Get internal and external IPs from gcloud
     try:
@@ -170,6 +173,8 @@ def load_cluster_info(config_path: str) -> ClusterInfo:
         external_ip=external_ip,
         zone=zone,
         project=project,
+        ssh_user=ssh_user,
+        ssh_private_key=ssh_private_key,
     )
 
 
@@ -232,35 +237,7 @@ def create_ssh_proxy_chain(
     # Sort for deterministic ordering
     cluster_names = sorted(clusters.keys())
 
-    # Build SSH command with all port forwards
-    ssh_cmd = [
-        "ssh",
-        "-tt",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "IdentitiesOnly=yes",
-        "-o",
-        "ExitOnForwardFailure=yes",
-        "-i",
-        os.path.expanduser("~/.ssh/marin_ray_cluster.pem"),
-    ]
-
-    # Add port forwards for each cluster
-    for cluster_name in cluster_names:
-        cluster = clusters[cluster_name]
-        ports = port_mappings[cluster_name]
-        ssh_cmd.extend(
-            [
-                f"-L{ports.dashboard_port}:{cluster.head_ip}:8265",
-                f"-L{ports.gcs_port}:{cluster.head_ip}:6379",
-                f"-L{ports.api_port}:{cluster.head_ip}:10001",
-            ]
-        )
-
-    # shuffle clusters and find one we can ping
+    # Shuffle clusters and find one we can ping.
     clusters_list = list(clusters.values())
 
     random.shuffle(clusters_list)
@@ -287,7 +264,35 @@ def create_ssh_proxy_chain(
     if not cluster_to_use:
         raise RuntimeError("No reachable cluster found with external IP")
 
-    ssh_cmd.extend([f"ray@{cluster_to_use.external_ip}", "while true; do sleep 86400; done"])
+    # Build SSH command with all port forwards.
+    ssh_cmd = [
+        "ssh",
+        "-tt",
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-i",
+        cluster_to_use.ssh_private_key,
+    ]
+
+    # Add port forwards for each cluster.
+    for cluster_name in cluster_names:
+        cluster = clusters[cluster_name]
+        ports = port_mappings[cluster_name]
+        ssh_cmd.extend(
+            [
+                f"-L{ports.dashboard_port}:{cluster.head_ip}:8265",
+                f"-L{ports.gcs_port}:{cluster.head_ip}:6379",
+                f"-L{ports.api_port}:{cluster.head_ip}:10001",
+            ]
+        )
+
+    ssh_cmd.extend([f"{cluster_to_use.ssh_user}@{cluster_to_use.external_ip}", "while true; do sleep 86400; done"])
     logger.info(f"Creating SSH proxy chain through {cluster_to_use.cluster_name}")
     logger.info(f"Tunneling to {len(clusters)} clusters. Port mapping: {port_mappings}")
 

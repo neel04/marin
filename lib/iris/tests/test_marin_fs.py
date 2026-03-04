@@ -114,7 +114,7 @@ def test_marin_temp_bucket_from_env_prefix():
         patch("iris.marin_fs.urllib.request.urlopen", side_effect=OSError("not on GCP")),
         patch.dict(os.environ, {"MARIN_PREFIX": "gs://marin-us-east1/scratch"}),
     ):
-        assert marin_temp_bucket(ttl_days=3, prefix="zephyr") == "gs://marin-tmp-us-east1/ttl=3d/zephyr"
+        assert marin_temp_bucket(ttl_days=3, prefix="zephyr") == "gs://marin-us-east1/scratch/tmp/zephyr"
 
 
 def test_marin_temp_bucket_falls_back_to_marin_prefix_when_no_region():

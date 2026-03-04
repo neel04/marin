@@ -290,6 +290,8 @@ def run_levanter_train_lm(config: TrainLmOnPodConfig):
         extras.append("tpu")
     elif isinstance(config.resources.device, GpuConfig):
         extras.append("gpu")
+    if train_config.eval_harness is not None:
+        extras.append("eval")
 
     # Note: Using a constant job name allows restarts to adopt the existing job handle
     # instead of raising a duplicate name error (adopt_existing=True is the default).

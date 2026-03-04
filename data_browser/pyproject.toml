@@ -7,7 +7,7 @@ name = "data-browser"
 version = "0.1.0"
 description = "Marin Data Browser"
 authors = [{ name = "Marin Team" }]
-requires-python = ">=3.11"
+requires-python = "==3.12.*"
 dependencies = [
     "fsspec>=2024.9.0",
     "zstandard>=0.18.0",

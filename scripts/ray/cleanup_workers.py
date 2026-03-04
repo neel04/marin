@@ -6,8 +6,9 @@
 Cleanup Ray TPU workers: handle preempted TPUs and low disk space.
 
 Usage:
-    uv run python scripts/ray/cleanup_workers.py                    # all clusters
+    uv run python scripts/ray/cleanup_workers.py                    # all matching clusters
     uv run python scripts/ray/cleanup_workers.py --config infra/marin-us-central1.yaml
+    uv run python scripts/ray/cleanup_workers.py --project asura-0
     uv run python scripts/ray/cleanup_workers.py --dry-run
 """
 
@@ -240,15 +241,21 @@ def restart_worker(
         return RestartResult(tpu_name, worker_id, False, "timeout")
 
 
-def process_cluster(config_path: str, threshold: int, dry_run: bool, parallel: int) -> bool:
+def process_cluster(
+    config_path: str, threshold: int, dry_run: bool, parallel: int, project_filter: str | None = None
+) -> bool:
     """Process a single cluster. Returns True if successful."""
     with open(config_path) as f:
         config = yaml.safe_load(f)
 
     cluster_name = config["cluster_name"]
     zone = config["provider"]["availability_zone"]
-    project = config["provider"].get("project", "hai-gcp-models")
+    project = config["provider"].get("project_id") or config["provider"].get("project") or "hai-gcp-models"
     docker_image = config["docker"]["image"]
+
+    if project_filter and project != project_filter:
+        logger.info(f"Skipping {cluster_name}: project {project} does not match filter {project_filter}")
+        return True
 
     logger.info(f"\n{'=' * 60}\nCluster: {cluster_name} ({zone})\n{'=' * 60}")
 
@@ -331,15 +338,16 @@ def process_cluster(config_path: str, threshold: int, dry_run: bool, parallel: i
 
 @click.command()
 @click.option("--config", help="Path to cluster config YAML (default: all infra/*.yaml)")
+@click.option("--project", "project_filter", help="Only process clusters in this GCP project")
 @click.option("--threshold", type=int, default=10, help="Restart workers with less than this % free disk")
 @click.option("--dry-run", is_flag=True, help="Show what would be done without making changes")
 @click.option("--parallel", type=int, default=32, help="Number of parallel operations")
-def main(config, threshold, dry_run, parallel):
+def main(config, project_filter, threshold, dry_run, parallel):
     """Cleanup Ray TPU workers: handle preempted TPUs and low disk space."""
     if config:
         configs = [config]
     else:
-        configs = sorted(glob("infra/marin-*.yaml"))
+        configs = sorted(path for path in glob("infra/marin-*.yaml") if "template" not in path)
         if not configs:
             logger.error("No config files found in infra/marin-*.yaml")
             sys.exit(1)
@@ -348,7 +356,7 @@ def main(config, threshold, dry_run, parallel):
     failed = []
     for cfg in configs:
         try:
-            if not process_cluster(cfg, threshold, dry_run, parallel):
+            if not process_cluster(cfg, threshold, dry_run, parallel, project_filter):
                 failed.append(cfg)
         except Exception as e:
             logger.error(f"Error processing {cfg}: {e}")

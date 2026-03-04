@@ -86,6 +86,8 @@ class ClusterInfo:
     external_ip: str | None
     zone: str
     project: str
+    ssh_user: str = "ray"
+    ssh_private_key: str = "~/.ssh/marin_ray_cluster.pem"
 
 
 def format_number(value_str: str) -> str:
