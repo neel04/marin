@@ -182,22 +182,27 @@ def get_current_tpu_is_preempted() -> bool:
 
 def _handle_ray_error(e: RayError):
     """Handle a Ray error from a TPU pod, classifying it as preemption, failure, or run error."""
+    preemption_errors = (NodeDiedError, OwnerDiedError, ActorUnavailableError, ActorDiedError, WorkerCrashedError)
+
     if isinstance(e, NodeDiedError):
-        logger.exception("Node died", exc_info=e)
+        logger.warning(f"Node died; retrying as preempted: {e}")
         return TpuPreempted(e)
     elif isinstance(e, OwnerDiedError):
-        logger.exception("Owner died", exc_info=e)
+        logger.warning(f"Owner died; retrying as preempted: {e}")
         return TpuPreempted(e)
     elif isinstance(e, ActorUnavailableError | ActorDiedError):
-        logger.exception("Actor died", exc_info=e)
+        logger.warning(f"Actor died; retrying as preempted: {e}")
         return TpuPreempted(e)
     elif isinstance(e, WorkerCrashedError):
-        logger.exception("Worker crashed", exc_info=e)
+        logger.warning(f"Worker crashed; retrying as preempted: {e}")
         return TpuPreempted(e)
     elif isinstance(e, RaySystemError):
         logger.exception("System error", exc_info=e)
         return TpuRunError(e)
     elif isinstance(e, RayTaskError):
+        if isinstance(e.cause, preemption_errors):
+            logger.warning(f"Task failed due to owner/node/actor loss; retrying as preempted: {e}")
+            return TpuPreempted(e)
         if get_current_tpu_is_preempted():
             logger.exception("Preempted", exc_info=e)
             return TpuPreempted(e)
@@ -847,7 +852,7 @@ def run_on_pod_ray(
                         exc_info=problem,
                     )
                 else:
-                    logger.warning(f"Preempted {num_preemptions} times. Continuing to retry.", exc_info=problem)
+                    logger.warning(f"Preempted {num_preemptions} times. Continuing to retry. Last error: {problem}")
                 continue
             elif any_failed:
                 problem = problems[0] if problems else RuntimeError("TPU job failed")

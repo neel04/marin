@@ -1,8 +1,8 @@
-# Copyright 2025 The Marin Authors
+# Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Train an optimized 300M config on MiniPile using an existing v6e-32 TPU slice.
+Train an optimized 300M config on MiniPile @ TPUs.
 
 This keeps the same Ray/TPU launch path as the bignode tutorial, but replaces the
 large FineWeb cache with a much smaller MiniPile smoke test dataset.
@@ -10,10 +10,13 @@ large FineWeb cache with a much smaller MiniPile smoke test dataset.
 
 import math
 import os
+from dataclasses import replace
 
 from fray.v2 import ResourceConfig
+from haliax.partitioning import ResourceAxis
 from levanter.callbacks.profiler import ProfilerConfig
 from levanter.data.text import TextLmDatasetFormat
+from levanter.utils.mesh import MeshConfig
 from marin.execution.executor import executor_main
 
 from experiments.defaults import default_tokenize, default_train
@@ -29,7 +32,7 @@ PROFILE_PERFETTO_LINK = os.environ.get("MARIN_PROFILE_PERFETTO_LINK", "").lower(
 
 EPOCHS = 2
 SEQ_LEN = 512
-BATCH_SIZE = 1024
+BATCH_SIZE = 1536
 MINIPILE_HF_ID = "JeanKaddour/minipile"
 MINIPILE_TRAIN_TOKENS = 1_434_081_494
 NUM_TRAIN_STEPS = math.ceil(EPOCHS * MINIPILE_TRAIN_TOKENS / (BATCH_SIZE * SEQ_LEN))
@@ -65,14 +68,25 @@ train_config = SimpleTrainConfig(
     ),
 )
 
+llama_300m_no_remat = replace(llama_300m, gradient_checkpointing=False)
+
+pure_ddp_mesh = MeshConfig(
+    compute_mapping={
+        "token": (ResourceAxis.REPLICA_DCN, ResourceAxis.REPLICA, ResourceAxis.DATA),
+        "token_repeat": (ResourceAxis.REPLICA_DCN, ResourceAxis.REPLICA, ResourceAxis.DATA),
+    },
+    param_mapping={},
+)
+
 llama_300m_minipile_model = default_train(
-    name="prof_llama_300M_minipile_bsz_1024",
+    name=f"32_DDP_llama_300M_minipile_bsz_{BATCH_SIZE}",
     tokenized=minipile_tokenized,
-    model_config=llama_300m,
+    model_config=llama_300m_no_remat,
     train_config=train_config,
     tags=["opt", "llama", "300m", "minipile", "bignode"],
     eval_harness_tasks=CORE_TASKS,
     use_default_validation=False,
+    trainer_mesh=pure_ddp_mesh,
 )
 
 if __name__ == "__main__":

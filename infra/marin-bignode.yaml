@@ -38,7 +38,7 @@ docker:
     - -e TPU_MIN_LOG_LEVEL=3
     - -e TPU_STDERR_LOG_LEVEL=3
     - -e TPU_LOG_DIR=disabled
-    - -e LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=81920 --xla_enable_async_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
+    - -e LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=163840 --xla_enable_async_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
     - -v "/var/run/docker.sock:/var/run/docker.sock"
     - -e RAY_AUTH_MODE=token
     - -e RAY_AUTH_TOKEN_PATH=/home/ray/.ray/auth_token
@@ -54,7 +54,7 @@ docker:
     - -e TPU_MIN_LOG_LEVEL=3
     - -e TPU_STDERR_LOG_LEVEL=3
     - -e TPU_LOG_DIR=disabled
-    - -e LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=81920 --xla_enable_async_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
+    - -e LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=163840 --xla_enable_async_all_gather=true --xla_tpu_overlap_compute_collective_tc=true --xla_tpu_enable_async_collective_fusion_multiple_steps=true --xla_tpu_enable_async_collective_fusion=true --xla_tpu_enable_async_collective_fusion_fuse_all_gather=true"
     - -e RAY_AUTH_MODE=token
     - -e RAY_AUTH_TOKEN_PATH=/home/ray/.ray/auth_token
 

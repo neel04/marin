@@ -286,6 +286,7 @@ def default_train(
     wandb_name: str | None = None,
     wandb_group: str | None = None,
     override_output_path: str | None = None,
+    trainer_mesh: MeshConfig | None = None,
 ) -> ExecutorStep:
     """
     Train a language model using the default configuration.
@@ -300,6 +301,7 @@ def default_train(
         eval_harness_tasks: List of evaluation harness tasks. Defaults to the CORE set of tasks. Use () or [] to disable
         wandb_name: Optional W&B display name for this run. Defaults to W&B's auto-generated name.
         wandb_group: Optional W&B group to organize related runs (e.g., a sweep). If unset, defaults to $WANDB_GROUP.
+        trainer_mesh: Optional mesh override for TrainerConfig. If unset, uses the default mesh config.
     """
 
     pretraining_data = _prepare_data_config(tokenized, use_default_validation)
@@ -362,13 +364,17 @@ def default_train(
                 keep=[dict(every=steps_per_export)],
             ),
             model_averaging=model_averaging,
-            mesh=MeshConfig(
-                # Special axes for MoEs
-                # TODO: this is actually bad and we should remove, but keeping for now
-                compute_mapping={
-                    "token": (ResourceAxis.REPLICA_DCN, ResourceAxis.REPLICA, ResourceAxis.DATA),
-                    "token_repeat": (ResourceAxis.REPLICA_DCN, ResourceAxis.REPLICA, ResourceAxis.DATA),
-                }
+            mesh=(
+                trainer_mesh
+                if trainer_mesh is not None
+                else MeshConfig(
+                    # Special axes for MoEs
+                    # TODO: this is actually bad and we should remove, but keeping for now
+                    compute_mapping={
+                        "token": (ResourceAxis.REPLICA_DCN, ResourceAxis.REPLICA, ResourceAxis.DATA),
+                        "token_repeat": (ResourceAxis.REPLICA_DCN, ResourceAxis.REPLICA, ResourceAxis.DATA),
+                    }
+                )
             ),
             allow_partial_checkpoint=train_config.allow_partial_checkpoint,
             per_device_eval_parallelism=per_device_eval_parallelism,
