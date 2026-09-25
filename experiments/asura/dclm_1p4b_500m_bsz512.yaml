@@ -1,0 +1,27 @@
+# Go-to 1.4B DCLM run on a Spot v5p-8 host. Use a new run ID for each run.
+project: asura-0
+zone: europe-west4-b
+bucket: gs://marin-asura-0-europe-west4
+prefix: gs://marin-asura-0-europe-west4/dclm-1p4b-2p8b/2026-09-25
+cpu_vm: marin-dclm-data-20260925
+tpu_vm: marin-dclm-v5p8-20260925
+# Compute Engine ct5p-hightpu-4t is one v5p-8 host with four chips.
+data:
+  cache_name: tokenized/asura-dclm-baseline-1p4b-2p8b
+  tokenizer: marin-community/marin-tokenizer
+  version: "2026.09.25"
+training:
+  model: llama_1_4b
+  target_tokens: 500000000
+  batch_size: 512
+  seq_len: 2048
+  learning_rate: 0.0003
+  weight_decay: 0.033
+  # 22 steps warm up over 23.1M tokens, about 4.6% of this run.
+  warmup: 22
+  min_lr_ratio: 0.1
+  z_loss_weight: 0.0001
+  tensor_parallel_size: 1
+  accelerator: v5p-8
+  wandb_entity: neel
+  wandb_project: marin
