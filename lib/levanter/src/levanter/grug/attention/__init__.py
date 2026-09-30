@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from levanter.grug.attention._core import (
+    SPLASH_RESIDUALS as SPLASH_RESIDUALS,
     AttentionMask as AttentionMask,
     GrugAttentionImplementation as GrugAttentionImplementation,
     RotaryConfig as RotaryConfig,

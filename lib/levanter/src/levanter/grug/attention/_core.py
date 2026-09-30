@@ -26,6 +26,10 @@ from levanter.kernels.pallas.splash_attention import (
     splash_partition_spec_shard_factor,
 )
 
+# Checkpoint name on the Splash kernel's residuals, so a remat policy can keep them and skip recomputing
+# the attention forward in the backward pass.
+SPLASH_RESIDUALS = "splash_residuals"
+
 GrugAttentionImplementation = Literal[
     "reference",
     "tpu_splash",
@@ -406,6 +410,7 @@ def _tpu_splash_attention(
         block_sizes=block_sizes,
         head_shards=head_shards,
         q_seq_shards=q_seq_shards,
+        residual_checkpoint_name=SPLASH_RESIDUALS,
     )
 
     @functools.partial(

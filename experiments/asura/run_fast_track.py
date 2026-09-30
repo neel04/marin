@@ -1,33 +1,75 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Launch the public-source Fast Track dense rung from a local GCP controller."""
+"""Launch one Fast Track dense rung on the asura TPU setup from a local controller.
+
+Create and set up the slice first with ``experiments.asura.tpu_slice``. The reference setup and its
+results are in docs/experiments/ledger.md.
+"""
 
 import argparse
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import yaml
 from fray.current_client import set_current_client
 from fray.types import ResourceConfig
-from marin.execution.lazy import resolve
-from marin.experiment.data import tokenized
-from marin.processing.tokenize.cache_stats import read_tokenized_cache_stats
+from marin.datakit.download.uncheatable_eval import UncheatableEvalDownloadConfig, download_latest_uncheatable_eval
+from marin.execution.lazy import ArtifactStep, resolve
+from marin.experiment.data import raw_download, tokenized
 
 from experiments.asura.run_dclm import GcpSshClient, GcpWorkerSettings
-from experiments.grug.fast_track.launch import SEQ_LEN, build_h100_ladder_run
+from experiments.datasets.paloma import paloma_datasets
+from experiments.datasets.uncheatable import UNCHEATABLE_SUBSETS
+from experiments.grug.fast_track.launch import H100_LADDER_SIZES, build_h100_ladder_run
+
+# Spot slices can be preempted, so keep recovery checkpoints close together.
+RESUME_SAVE_INTERVAL = timedelta(minutes=15)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True)
-    args = parser.parse_args()
-    config = yaml.safe_load(args.config.read_text())
+def validation_sets(tokenizer: str, config: dict) -> list[ArtifactStep]:
+    """WikiText-103, every Paloma subset, and the Uncheatable Eval dump pinned to one commit."""
+    version = config["version"]
+    commit = config["uncheatable_commit"]
+    uncheatable_raw = raw_download(
+        f"raw/uncheatable_eval-{commit[:7]}",
+        fn=download_latest_uncheatable_eval,
+        build_config=lambda ctx: UncheatableEvalDownloadConfig(
+            output_path=ctx.output_path,
+            repo_owner="ziqing-huang",
+            repo_name="uncheatable_eval",
+            data_path="data",
+            branch=commit,
+        ),
+        version=version,
+    )
+    return [
+        tokenized(
+            f"fasttrack-public-wikitext103-{tokenizer}",
+            version=version,
+            paths=[config["wikitext_raw"]],
+            tokenizer=tokenizer,
+            validation=True,
+            resources=ResourceConfig.with_cpu(cpu=8, ram="32g", disk="20g"),
+        ),
+        *paloma_datasets(tokenizer=tokenizer, tag=tokenizer, raw_prefix=config["paloma_raw"], version=version).values(),
+        *(
+            tokenized(
+                f"uncheatable_eval/{subset}-{tokenizer}",
+                tokenizer=tokenizer,
+                version=version,
+                raw=uncheatable_raw,
+                glob=glob,
+                validation=True,
+            )
+            for subset, glob in UNCHEATABLE_SUBSETS.items()
+        ),
+    ]
 
-    os.environ["MARIN_CLUSTER"] = "asura"
-    os.environ["MARIN_PREFIX"] = config["prefix"]
-    os.environ["MARIN_TEMP_PREFIX"] = config["bucket"]
-    settings = GcpWorkerSettings(
+
+def worker_settings(config: dict) -> GcpWorkerSettings:
+    return GcpWorkerSettings(
         project=config["project"],
         zone=config["zone"],
         bucket=config["bucket"],
@@ -38,39 +80,40 @@ def main() -> None:
         wandb_entity=config["wandb_entity"],
     )
 
-    required_tokens = config["batch_size"] * config["num_steps"] * SEQ_LEN
-    cache = config["train_cache"].rstrip("/")
-    tokens = read_tokenized_cache_stats(cache, "train").total_tokens
-    if tokens < required_tokens:
-        raise ValueError(f"DCLM cache has only {tokens:,} distinct tokens")
-    train_caches = {"dclm": f"{cache}/train"}
-    print(f"DCLM: {tokens:,} tokens at {cache}/train", flush=True)
 
-    validation = tokenized(
-        "fasttrack-public-wikitext103-16k",
-        version=config["version"],
-        paths=[config["validation_path"]],
-        tokenizer=config["tokenizer"],
-        validation=True,
-        resources=ResourceConfig.with_cpu(cpu=8, ram="32g", disk="20g"),
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--size", required=True, choices=H100_LADDER_SIZES)
+    parser.add_argument("--run-id", required=True)
+    parser.add_argument(
+        "--num-steps",
+        type=int,
+        help="Short probe run without permanent checkpoints. Omit for the data-matched rung.",
     )
+    args = parser.parse_args()
+    config = yaml.safe_load(args.config.read_text())
+
+    os.environ["MARIN_CLUSTER"] = "asura"
+    os.environ["MARIN_PREFIX"] = config["prefix"]
+    os.environ["MARIN_TEMP_PREFIX"] = config["bucket"]
     run = build_h100_ladder_run(
-        run_id=config["run_id"],
-        size="d1280",
+        run_id=args.run_id,
+        size=args.size,
         dense=True,
         accelerator=config["accelerator"],
         tokenizer=config["tokenizer"],
-        train_caches=train_caches,
-        validation=[validation],
-        batch_size=config["batch_size"],
-        num_steps=config["num_steps"],
+        train_caches={"dclm": config["train_cache"]},
+        validation=validation_sets(config["tokenizer"], config["eval"]),
+        num_steps=args.num_steps,
         version=config["version"],
         wandb_entity=config["wandb_entity"],
         wandb_project=config["wandb_project"],
-        save_checkpoints=True,
+        save_checkpoints=args.num_steps is None,
+        resume_save_interval=RESUME_SAVE_INTERVAL,
     )
-    print(f"Launching {config['run_id']} for {required_tokens:,} tokens on {config['accelerator']}", flush=True)
-    with set_current_client(GcpSshClient(settings)):
+    print(f"Launching {args.run_id}: {args.size} on {config['accelerator']}", flush=True)
+    with set_current_client(GcpSshClient(worker_settings(config))):
         resolve(run, max_concurrent=1)
 
 

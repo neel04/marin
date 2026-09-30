@@ -13,7 +13,10 @@ from jax.sharding import Mesh, PartitionSpec
 
 
 SPLASH_BLOCK_GRANULARITY = 128
-DEFAULT_SPLASH_BLOCK_SIZE = 512
+DEFAULT_SPLASH_BLOCK_SIZE = 2048
+# Cap on the compute tile inside a block. With 2048-token blocks this was the fastest setting for Fast Track
+# d1280 on v6e and v5p.
+MAX_SPLASH_COMPUTE_BLOCK_SIZE = 1024
 PartitionSpecEntry = str | Sequence[str | None] | None
 
 
@@ -133,15 +136,15 @@ def splash_attention_block_sizes(
     block_q = _compatible_splash_block(shard_q_seq_len, max_block_size)
     block_kv = _compatible_splash_block(shard_kv_seq_len, max_block_size)
 
+    # The fused backward computes dq alongside dk/dv, so it takes no separate dq blocks.
     return splash_attention_kernel.BlockSizes(
         block_q=block_q,
-        block_kv_compute=block_kv,
+        block_kv_compute=min(block_kv, MAX_SPLASH_COMPUTE_BLOCK_SIZE),
         block_kv=block_kv,
         block_q_dkv=block_q,
         block_kv_dkv=block_kv,
-        block_kv_dkv_compute=block_q,
-        block_q_dq=block_q,
-        block_kv_dq=block_kv,
+        block_kv_dkv_compute=min(block_q, MAX_SPLASH_COMPUTE_BLOCK_SIZE),
+        use_fused_bwd_kernel=True,
     )
 
 

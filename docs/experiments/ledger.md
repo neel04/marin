@@ -24,12 +24,10 @@ Both reference rows use this configuration. A variant must change only the thing
   2,760 steps at batch 256. Sequence length is 4,096.
 - Attention: local layers use the 2,048-token sliding window through `CausalSelfAttention._attend`. TPU runs
   from before 2026-09-27 ran full causal attention on local layers.
-- TPU kernels: the workers applied
-  [`v6e-opt.patch`](https://storage.cloud.google.com/marin-asura-0-europe-west4/fasttrack-public-20260926/tpu-ladder/scripts/v6e-opt.patch),
-  which is not in the repository. It sets the splash attention block size to 2,048 with 1,024-wide compute
-  blocks, uses the fused backward kernel, saves the splash residuals under layer remat, and uses the Pallas
-  cross-entropy kernel. Against materialized reference attention with XLA cross-entropy, 100 d768 steps
-  from the same data and initialization differed by at most 0.0052 in training loss, a relative 9.8e-4.
+- TPU kernels: Splash attention uses 2,048-token blocks with 1,024-wide compute tiles and the fused backward
+  kernel. Layer remat keeps the Splash residuals, and the loss uses the Pallas cross-entropy kernel. Against
+  materialized reference attention with XLA cross-entropy, 100 d768 steps from the same data and
+  initialization differed by at most 0.0052 in training loss, a relative 9.8e-4.
 - Data: `mlfoundations/dclm-baseline-1.0` at revision `a3b142c183aebe5af344955ae20836eb34dcf69b`, files
   `global-shard_01_of_10/local-shard_1_of_10/shard_00000000` through `shard_00000055`. That is 5,130,610
   documents. The cache is `tokenized/fasttrack-dclm-bpe16k-shuf-20260928/train` (6,783,798,009 tokens),
@@ -45,9 +43,11 @@ Both reference rows use this configuration. A variant must change only the thing
 - Hardware: a Spot v5p-32 slice, four `ct5p-hightpu-4t` VMs in one managed instance group in
   `europe-west4-b`. A local controller dispatches the job to each host over SSH.
 
-All paths are under `gs://marin-asura-0-europe-west4/fasttrack-public-20260926`. The controller, worker
-setup, evaluation-set definitions, and tokenizer trainer are under `tpu-ladder/scripts/`. The tokenizer
-mirror is `tokenizers/dclm-bpe-v16384/hf-hub-1.21.0/`. Final checkpoints are under
+The setup is [`fast_track_dense_ladder.yaml`](https://github.com/marin-community/marin/blob/main/experiments/asura/fast_track_dense_ladder.yaml);
+the Fast Track README has the launch commands. Data paths are under
+`gs://marin-asura-0-europe-west4/fasttrack-public-20260926`. The scripts that restored the shards, trained
+the tokenizer, and built the caches are under `tpu-ladder/scripts/` there. The tokenizer mirror is
+`tokenizers/dclm-bpe-v16384/hf-hub-1.21.0/`. Final checkpoints are under
 `grug/fasttrack-dense-{d768,d1024}-dclmbpe-v5p32-20260928/2026.09.28/checkpoints/`.
 
 ## Relation to the H100 baseline
@@ -78,8 +78,8 @@ sliding-window fix, so their losses are not comparable with the leaderboard.
 
 ## Add an entry
 
-1. Train the variant on the reference cache, tokenizer, evaluation sets, batch, and step count for the rung.
-   Change only the variant.
+1. Launch the variant with `experiments.asura.run_fast_track` and the ladder config, which fixes the
+   reference cache, tokenizer, evaluation sets, batch, and step count for the rung. Change only the variant.
 2. Add a row with the W&B link and the same columns. Mark it in the Run column; keep the reference rows.
 3. For an effective-speedup estimate, use `effective_speedup` from the
    [agent guide](https://github.com/marin-community/marin/blob/main/experiments/grug/fast_track/agent.md). Use `L_inf = 1.2` and `alpha = 0.0844` from

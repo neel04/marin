@@ -12,4 +12,5 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 cd "$root/repo"
 uv sync --package marin-core --extra tpu --extra dedup --no-dev
-.venv/bin/python -c 'import jax, marin, levanter; print("jax", jax.__version__, "devices", [str(x) for x in jax.devices()])'
+# Import check only: on a multi-host slice, jax.devices() blocks until every host joins.
+.venv/bin/python -c 'import jax, marin, levanter; print("jax", jax.__version__)'

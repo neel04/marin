@@ -132,17 +132,21 @@ uv run fast-track --submit --run-id probe-d1280 --size d1280 --num-steps 20 --no
 Results land in W&B `marin-community/marin_moe`; eval bpb keys are `eval/paloma/macro_bpb`,
 `eval/uncheatable_eval/macro_bpb` (MoE dropless eval logs under the normal `eval/` prefix).
 
-## Public DCLM on v5p-8
+## Dense ladder on TPU
 
-The [Asura recipe](../../asura/fast_track_dense_d1280_dclm.yaml) runs the d1280 dense model for
-5,230,297,088 tokens with public DCLM data, a 16k tokenizer, and WikiText-103 validation. On the
-configured GCP CPU VM, build its regional cache with `experiments.asura.fast_track_dclm_data`.
-After the cache is complete, launch `experiments.asura.run_fast_track` from the local controller:
+Dense rungs also run on a Spot v5p-32 slice in the asura GCP project, launched from a local controller.
+The [ladder config](../../asura/fast_track_dense_ladder.yaml) trains on public DCLM with a 16k tokenizer
+built from the `hero-bpe-v16384` recipe. The reference results and their setup are in
+[the TPU ledger](../../../docs/experiments/ledger.md). They are not comparable with the H100 table above,
+which trained on the Hero mix.
 
 ```sh
-uv run python -m experiments.asura.run_fast_track \
-  --config experiments/asura/fast_track_dense_d1280_dclm.yaml
+config=experiments/asura/fast_track_dense_ladder.yaml
+uv run python -m experiments.asura.tpu_slice create --config $config
+WANDB_API_KEY=... uv run python -m experiments.asura.tpu_slice setup --config $config
+uv run python -m experiments.asura.run_fast_track --config $config --size d768 --run-id <run-id>
+uv run python -m experiments.asura.tpu_slice delete --config $config
 ```
 
-The public DCLM run uses different data, tokenizer, validation, and hardware from the H100
-baseline above. Its WikiText loss cannot be compared directly with Paloma macro loss.
+`setup` copies this checkout, including uncommitted edits, to every host; rerun it after changing code.
+Keep the controller running until the job finishes, and delete the slice when you are done.

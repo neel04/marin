@@ -73,17 +73,13 @@ def test_lower_splash_segment_ids_packages_arrays_specs_and_batch_axes():
     assert lowering.segment_batch_axis.q == 0
 
 
-def test_splash_attention_block_sizes_match_existing_defaults():
-    block_sizes = splash_attention_block_sizes(
-        q_seq_len=1024,
-        kv_seq_len=1024,
-        q_seq_shards=2,
-        kv_seq_shards=1,
-    )
+def test_splash_attention_block_sizes_fit_each_shard():
+    short = splash_attention_block_sizes(q_seq_len=1024, kv_seq_len=1024, q_seq_shards=2, kv_seq_shards=1)
+    assert (short.block_q, short.block_kv, short.block_kv_compute) == (512, 1024, 1024)
 
-    assert block_sizes.block_q == 512
-    assert block_sizes.block_kv == 512
-    assert block_sizes.block_kv_compute == 512
+    # Long shards hit the block-size cap, and the compute tile stays within its own cap.
+    long = splash_attention_block_sizes(q_seq_len=8192, kv_seq_len=8192, q_seq_shards=2, kv_seq_shards=1)
+    assert (long.block_q, long.block_kv, long.block_kv_compute) == (2048, 2048, 1024)
 
 
 def _materialize_splash_mask(mask):

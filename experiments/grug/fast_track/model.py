@@ -23,6 +23,7 @@ except ModuleNotFoundError:
     from jax.experimental.shard_map import shard_map
 from jaxtyping import Array, Float, Int, PRNGKeyArray
 from levanter.grug.attention import (
+    SPLASH_RESIDUALS,
     AttentionMask,
     RotaryConfig,
     align_kv_heads,
@@ -51,6 +52,9 @@ _ROUTING_RENORM_SUM = 2.5
 _QB_HIST_BINS = 10_000
 _CE_TOKENS_PER_RANK = 65_536
 _CE_BLOCK_SIZES = BlockSizes(b_block_size=_CE_TOKENS_PER_RANK, v_block_size=4096)
+# Layers are fully rematerialized except the Splash residuals, so the TPU backward pass does not rerun the
+# attention forward. Other attention backends name no residuals, so they rematerialize everything.
+_REMAT_POLICY = jax.checkpoint_policies.save_only_these_names(SPLASH_RESIDUALS)
 # Axes the non-expert params FSDP-shard over.
 _FSDP_AXES: tuple[str, ...] = ("data", "expert")
 _LM_HEAD_PARTITION_SPEC = P(_FSDP_AXES, "model")
@@ -831,7 +835,7 @@ class Transformer(eqx.Module):
             use_long = jnp.asarray(layer_use_long_mask, dtype=jnp.bool_)
             lower_bounds = jnp.where(use_long, long_lower_bounds, short_lower_bounds)
             layer_mask = long_mask.with_fa4_bounds(lower_bounds, valid)
-            return eqx.filter_checkpoint(layer, policy=None)(
+            return eqx.filter_checkpoint(layer, policy=_REMAT_POLICY)(
                 carry_hidden,
                 layer_mask,
                 use_long,
@@ -891,6 +895,8 @@ class Transformer(eqx.Module):
         labels = jnp.pad(token_ids[:, 1:], ((0, 0), (0, 1))).astype(jnp.int32)
         loss_weight = loss_weight.astype(loss_dtype)
 
+        # The Pallas kernel is TPU-only and picks its own blocks; elsewhere use the blocked XLA kernel.
+        on_tpu = jax.default_backend() == "tpu"
         cross_entropy_loss = fused_linear_softmax_cross_entropy_loss(
             hidden,
             self.output_proj,
@@ -899,8 +905,8 @@ class Transformer(eqx.Module):
             reduction=reduction,
             logsumexp_weight=logsumexp_weight,
             dtype=loss_dtype,
-            implementation="xla_fast_bwd",
-            block_sizes=_CE_BLOCK_SIZES,
+            implementation="pallas_tpu" if on_tpu else "xla_fast_bwd",
+            block_sizes=None if on_tpu else _CE_BLOCK_SIZES,
         )
         # Router z-loss is logged for monitoring only; it is not added to the training loss.
         loss = cross_entropy_loss

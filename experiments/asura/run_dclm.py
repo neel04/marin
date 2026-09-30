@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import tempfile
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,6 +69,7 @@ class GcpWorkerSettings:
     prefix: str
     cpu_vm: str
     tpu_vm: str
+    """A single-host TPU VM, or a managed instance group whose hosts are named ``<tpu_vm>-<4 chars>``."""
     accelerator: str
     wandb_entity: str
 
@@ -154,32 +156,68 @@ class GcpSshClient:
             f"export MARIN_CLUSTER=asura MARIN_PREFIX={quoted_prefix} MARIN_TEMP_PREFIX={quoted_bucket} "
             f"FSSPEC_GS_TOKEN=cloud WANDB_MODE=online WANDB_ENTITY={quoted_entity} "
             "WANDB_DIR=$HOME/marin-asura-dclm/wandb HF_HOME=/tmp/hf-cache "
-            "LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=50000; "
+            "LIBTPU_INIT_ARGS=--xla_tpu_scoped_vmem_limit_kib=98304; "
             "unset JAX_PLATFORMS; "
         )
         if device.kind == "tpu":
             remote_command += 'export WANDB_API_KEY="$(cat "$HOME/.config/wandb/api-key")"; '
         remote_command += f".venv/bin/python -m experiments.asura.worker {quoted_payload}"
 
-        vm_name = self.settings.tpu_vm if device.kind == "tpu" else self.settings.cpu_vm
-        command = [
+        vms = tpu_hosts(self.settings) if device.kind == "tpu" else [self.settings.cpu_vm]
+        if device.kind == "tpu" and len(vms) != request.replicas:
+            raise ValueError(f"{self.settings.tpu_vm} has {len(vms)} hosts; {device.variant} needs {request.replicas}")
+
+        # Every host of a multi-host slice runs the same program; JAX joins them into one slice.
+        def run_on(vm: str) -> tuple[int, Path]:
+            log_path = Path(tempfile.gettempdir()) / f"marin-asura-{request.name}-{task_id}-{vm}.log"
+            with log_path.open("w") as log:
+                result = subprocess.run(
+                    [*ssh_command(self.settings, vm), f"--command={remote_command}"],
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+            print(f"Remote job {request.name} on {vm}: exit={result.returncode}; log {log_path}", flush=True)
+            return result.returncode, log_path
+
+        print(f"Dispatching {request.name} to {', '.join(vms)}", flush=True)
+        with ThreadPoolExecutor(max_workers=len(vms)) as pool:
+            results = list(pool.map(run_on, vms))
+        returncode, log_path = max(results, key=lambda result: result[0] != 0)
+        return SshJobHandle(request.name, returncode, log_path)
+
+
+def ssh_command(settings: GcpWorkerSettings, vm: str) -> list[str]:
+    return [
+        "gcloud",
+        "compute",
+        "ssh",
+        vm,
+        f"--project={settings.project}",
+        f"--zone={settings.zone}",
+        "--ssh-flag=-o ServerAliveInterval=30",
+        "--quiet",
+    ]
+
+
+def tpu_hosts(settings: GcpWorkerSettings) -> list[str]:
+    """The running TPU VM itself, or every running host of the managed instance group named ``tpu_vm``."""
+    listing = subprocess.run(
+        [
             "gcloud",
             "compute",
-            "ssh",
-            vm_name,
-            f"--project={self.settings.project}",
-            f"--zone={self.settings.zone}",
-            f"--command={remote_command}",
-            "--ssh-flag=-o ServerAliveInterval=30",
-            "--quiet",
-        ]
-
-        log_path = Path(tempfile.gettempdir()) / f"marin-asura-{request.name}-{task_id}.log"
-        print(f"Dispatching {request.name} to {device.kind}; log {log_path}", flush=True)
-        with log_path.open("w") as log:
-            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False)
-        print(f"Remote job {request.name} exit={result.returncode}; log {log_path}", flush=True)
-        return SshJobHandle(request.name, result.returncode, log_path)
+            "instances",
+            "list",
+            f"--project={settings.project}",
+            f"--zones={settings.zone}",
+            f'--filter=name~"^{settings.tpu_vm}(-[a-z0-9]{{4}})?$" AND status=RUNNING',
+            "--format=value(name)",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return sorted(listing.stdout.split())
 
 
 def main() -> None:
