@@ -300,10 +300,7 @@ class CausalSelfAttention(eqx.Module):
             q = jnp.where(keep, q_roped, q)
             k = jnp.where(keep, k_roped, k)
         q = q * self.cfg.qk_mult
-        # The fa4-cute kernel is GPU-only; fall back to auto-select off-GPU so the model still lowers
-        # on CPU (e.g. the grug variant-contract tests).
-        attn_impl = "gpu_fa4_cute" if jax.default_backend() == "gpu" else None
-        attn_out = attention(q, k, v, mask, implementation=attn_impl)
+        attn_out = self._attend(q, k, v, mask, is_global)
         # Exclusive Self Attention (XSA): subtract the component of yᵢ parallel to vᵢ, per head.
         # zᵢ = yᵢ - (yᵢᵀvᵢ / ‖vᵢ‖²) vᵢ.
         aligned_v = align_kv_heads(v, num_q_heads=attn_out.shape[2])
@@ -323,6 +320,31 @@ class CausalSelfAttention(eqx.Module):
             out_sharding=P(_BATCH_AXES, None, "model"),
         )
         return jnp.einsum("bsh,hd->bsd", attn_out, self.w_o, out_sharding=batch_spec)
+
+    def _attend(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        mask: AttentionMask | jax.Array,
+        is_global: bool | jax.Array,
+    ) -> jax.Array:
+        # The fa4-cute kernel is GPU-only and reads each layer's window from the mask's FA4 bounds.
+        if jax.default_backend() == "gpu":
+            return attention(q, k, v, mask, implementation="gpu_fa4_cute")
+        if not isinstance(mask, AttentionMask):
+            return attention(q, k, v, mask)
+        # Other backends (splash on TPU, reference on CPU) build the mask from `sliding_window`,
+        # so local layers must carry the window explicitly or they silently run full causal.
+        local_mask = mask.with_sliding_window(self.cfg.sliding_window)
+        if isinstance(is_global, bool):
+            return attention(q, k, v, mask if is_global else local_mask)
+        return jax.lax.cond(
+            jnp.asarray(is_global, dtype=jnp.bool_),
+            lambda qkv: attention(*qkv, mask),
+            lambda qkv: attention(*qkv, local_mask),
+            (q, k, v),
+        )
 
 
 class RMSNorm(eqx.Module):

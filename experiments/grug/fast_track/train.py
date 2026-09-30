@@ -443,6 +443,8 @@ def log_device_memory(step_info) -> None:
 
     """
     stats = jax.local_devices()[0].memory_stats()
+    if stats is None:
+        return
     levanter.tracker.log(
         {
             "memory/peak_gib": stats["peak_bytes_in_use"] / 1024**3,
@@ -1008,9 +1010,10 @@ def run_grug(config: GrugRunConfig) -> None:
     if trainer.id is None:
         raise ValueError("trainer.id must be set before dispatching grug training.")
 
-    # Dispatch snapshots os.environ for the child task, so apply the runtime defaults first.
-    inline_watch_enabled = trainer.watch.is_enabled and config.trainer.watch_mode == WatchMode.INLINE
-    _apply_runtime_defaults(inline_watch_enabled=inline_watch_enabled)
+    # Dispatch snapshots os.environ for the child task. These defaults are specific to GPU XLA.
+    if config.resources.device.kind == "gpu":
+        inline_watch_enabled = trainer.watch.is_enabled and config.trainer.watch_mode == WatchMode.INLINE
+        _apply_runtime_defaults(inline_watch_enabled=inline_watch_enabled)
     dispatch_grug_training_run(
         run_id=trainer.id,
         config=config,

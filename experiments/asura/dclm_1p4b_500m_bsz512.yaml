@@ -1,4 +1,5 @@
-# Go-to 1.4B DCLM run on a Spot v5p-8 host. Use a new run ID for each run.
+# Run with: uv run python -m experiments.asura.run_dclm --config <this-file> --run-id <new-run-id>
+# Reuse the run ID when resuming a checkpoint.
 project: asura-0
 zone: europe-west4-b
 bucket: gs://marin-asura-0-europe-west4

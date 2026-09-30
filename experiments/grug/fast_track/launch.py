@@ -1,10 +1,10 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-"""H100 dense-vs-MoE scaling ladder for the 16k-vocab BPE tokenizer study.
+"""Dense-vs-MoE scaling ladder for the 16k-vocab BPE tokenizer study.
 
-Rungs d512 / d768 / d1024 / d1280 map the model, data, and optimizer onto Hopper nodes and train on
-the in-region 16k BPE flat cache. Each variant (dense / MoE) has a baseline recipe; a run either
+Rungs d512 / d768 / d1024 / d1280 map the model, data, and optimizer onto Hopper nodes by default.
+Dense runs also support TPUs with an in-region cache. Each variant (dense / MoE) has a baseline recipe; a run either
 data-matches or compute-matches it (``--match``, default data), or sets ``--batch-size`` /
 ``--num-steps`` explicitly. See README.md for the results table and launch commands.
 """
@@ -14,6 +14,7 @@ import math
 import os
 import shlex
 import sys
+from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from enum import StrEnum
 
@@ -54,6 +55,7 @@ from experiments.grug.moe.launch_datakit_moe_mix import _val_component
 # Run defaults.
 H100_LADDER_SIZES = ("d512", "d768", "d1024", "d1280")
 DEFAULT_WANDB_PROJECT = "marin_moe"
+DEFAULT_WANDB_ENTITY = "marin-community"
 # Default tokens-per-active-param budgets defining each variant's baseline: dense compute-optimal, MoE 3x.
 DENSE_TPP = 20
 MOE_TPP = 60
@@ -215,24 +217,26 @@ def _active_params(cfg: GrugModelConfig) -> int:
 def _flat_cache_data_config(
     *,
     ctx: StepContext,
-    validation,
+    validation: Sequence[ArtifactStep],
     tokenizer: str,
-    train_cache_dir: str,
+    train_caches: Mapping[str, str],
 ) -> LmDataConfig:
-    """Straight-through single-source training on one pre-built flat cache (tokenizer-ablation runs).
+    """Train on pre-built flat caches with validation components at zero weight.
 
-    Mirrors the Harrier config's validation wiring, but trains on a single pre-tokenized cache at
-    constant weight -- no mixture phases, no simulated epoching. ``validation`` sets are folded in as
-    zero-weight components (built as executor deps, tokenized with the same ``tokenizer``).
+    Each training cache receives equal sampling weight. ``validation`` handles are built as
+    dependencies and added with zero training weight.
     """
+    if not train_caches:
+        raise ValueError("At least one training cache is required")
     components = {
-        "train": DatasetComponent(
+        name: DatasetComponent(
             source=None,
-            cache_dir=train_cache_dir,
+            cache_dir=cache_dir,
             format=TextLmDatasetFormat(),
-            tags=["train"],
+            tags=[name],
             flat_cache=True,
         )
+        for name, cache_dir in train_caches.items()
     }
     if ctx.is_fingerprint:
         val_components = {item.name: _val_component(ctx.artifact_path(item)) for item in validation}
@@ -241,7 +245,8 @@ def _flat_cache_data_config(
     collisions = components.keys() & val_components.keys()
     if collisions:
         raise ValueError(f"validation components collide with the training component: {sorted(collisions)}")
-    train_weights = {"train": 1.0, **{name: 0.0 for name in val_components}}
+    weight = 1.0 / len(components)
+    train_weights = {**{name: weight for name in components}, **{name: 0.0 for name in val_components}}
     return LmDataConfig(
         tokenizer=tokenizer,
         cache_dir=None,
@@ -259,35 +264,54 @@ def build_h100_ladder_run(
     num_steps: int | None = None,
     batch_size: int | None = None,
     wandb_project: str = DEFAULT_WANDB_PROJECT,
+    wandb_entity: str = DEFAULT_WANDB_ENTITY,
+    accelerator: str = "H100",
     version: str | None = None,
     tokenizer: str = V16384_TOKENIZER,
     train_cache_dir: str = V16384_CACHE_DIR,
+    train_caches: Mapping[str, str] | None = None,
+    validation: Sequence[ArtifactStep] | None = None,
     vocab_size: int = V16384_VOCAB,
     no_eval: bool = False,
     dense: bool = False,
     save_checkpoints: bool = False,
+    resume_save_interval: timedelta = RESUME_SAVE_INTERVAL,
 ) -> ArtifactStep[ThroughputResult]:
-    """Build one H100 scaling-ladder rung.
+    """Build one scaling-ladder rung on H100 or TPU.
 
     Budget resolution (see ``MatchMode``): ``batch_size`` defaults to the rung's baseline batch;
     ``num_steps`` overrides the step count directly, else it is derived to data- or compute-match the
     variant's baseline at that batch. Evaluation runs at the midpoint and end. Permanent checkpoints
-    default to the final step, with one rolling hourly checkpoint on region-local temporary storage.
+    default to the final step, with rolling recovery checkpoints on region-local temporary storage.
     """
     if not run_id.strip():
         raise ValueError("run_id must not be empty")
     if not wandb_project.strip():
         raise ValueError("wandb_project must not be empty")
+    if not wandb_entity.strip():
+        raise ValueError("wandb_entity must not be empty")
+    if accelerator not in {"H100", "v5p-8", "v5p-16", "v5p-32", "v6e-16"}:
+        raise ValueError(f"Unsupported accelerator: {accelerator}")
+    if accelerator != "H100" and not dense:
+        raise ValueError("The TPU Fast Track port supports dense runs only")
+    if accelerator != "H100" and train_caches is None and train_cache_dir == V16384_CACHE_DIR:
+        raise ValueError("A TPU run requires an in-region training cache")
 
     rung = _h100_ladder_rung(size)
     model = dataclasses.replace(_h100_ladder_model(rung, dense=dense), vocab_size=vocab_size)
     mp_policy = "params=float32,compute=bfloat16,output=bfloat16"
-    expert_axis_size = 1 if dense else rung.gpus_per_task
-    replica_axis_size = 1
-    if rung.global_device_count % (expert_axis_size * replica_axis_size) != 0:
+    train_resources = (
+        ResourceConfig.with_gpu("H100", count=rung.gpus_per_task, cpu=32, ram="600g", disk="900g")
+        if accelerator == "H100"
+        else ResourceConfig.with_tpu(accelerator, disk="100g")
+    )
+    global_device_count = train_resources.chip_count()
+    expert_axis_size = 1 if dense else global_device_count
+    replica_axis_size = train_resources.replicas
+    if global_device_count % (expert_axis_size * replica_axis_size) != 0:
         raise ValueError(
             f"expert_axis ({expert_axis_size}) * replica_axis ({replica_axis_size}) must divide "
-            f"global_device_count ({rung.global_device_count})"
+            f"global_device_count ({global_device_count})"
         )
 
     # Baseline: the recorded dense/MoE baseline for this size (DENSE_TPP/MOE_TPP at the rung's baseline
@@ -303,8 +327,8 @@ def build_h100_ladder_run(
     baseline_flops = _BASELINE_FLOPS_PER_EXAMPLE[(size, dense)] * baseline_steps * rung.baseline_batch
 
     batch_size = batch_size if batch_size is not None else rung.baseline_batch
-    if batch_size <= 0 or batch_size % rung.global_device_count != 0:
-        raise ValueError(f"batch_size must be positive and divisible by {rung.global_device_count}, got {batch_size}")
+    if batch_size <= 0 or batch_size % global_device_count != 0:
+        raise ValueError(f"batch_size must be positive and divisible by {global_device_count}, got {batch_size}")
     if num_steps is None:
         if match is MatchMode.DATA:
             # DATA holds the baseline's token budget.
@@ -336,23 +360,16 @@ def build_h100_ladder_run(
         expert_axis_size=expert_axis_size,
         replica_axis_size=replica_axis_size,
     )
-    train_resources = ResourceConfig.with_gpu(
-        "H100",
-        count=rung.gpus_per_task,
-        cpu=32,
-        ram="600g",
-        disk="900g",
-        replicas=1,
-    )
     name = f"grug/{run_id}"
     version = resolve_version(name, version)
     eval_tag = tokenizer.rsplit("/", 1)[-1]
-    validation = [
-        *uncheatable_datasets(tokenizer=tokenizer, tag=eval_tag).values(),
-        *paloma_datasets(
-            tokenizer=tokenizer, tag=eval_tag, raw_prefix=_PALOMA_DETOK_RAW, version=PALOMA_DETOK_VERSION
-        ).values(),
-    ]
+    if validation is None:
+        validation = [
+            *uncheatable_datasets(tokenizer=tokenizer, tag=eval_tag).values(),
+            *paloma_datasets(
+                tokenizer=tokenizer, tag=eval_tag, raw_prefix=_PALOMA_DETOK_RAW, version=PALOMA_DETOK_VERSION
+            ).values(),
+        ]
 
     def build_config(ctx: StepContext) -> GrugRunConfig:
         permanent_checkpoint_path = prefix_join(ctx.output_path, "checkpoints")
@@ -366,9 +383,9 @@ def build_h100_ladder_run(
             profiler=ProfilerConfig(enabled=False),
             mp=jmp.get_policy(mp_policy),
             tracker=WandbConfig(
-                entity="marin-community",
+                entity=wandb_entity,
                 project=wandb_project,
-                tags=["h100", "fasttrack", "vocab-16k"],
+                tags=[accelerator.lower(), "fasttrack", "vocab-16k"],
                 group="fasttrack-scaling-ladder",
                 name=run_id,
                 replicate_path=ctx.output_path,
@@ -389,7 +406,7 @@ def build_h100_ladder_run(
             checkpointer=CheckpointerConfig(
                 base_path=permanent_checkpoint_path,
                 temporary_base_path=temporary_checkpoint_path,
-                save_interval=RESUME_SAVE_INTERVAL,
+                save_interval=resume_save_interval,
                 keep=None,
                 append_run_id_to_base_path=False,
                 delete_old_temp_checkpoints=True,
@@ -397,7 +414,10 @@ def build_h100_ladder_run(
             ),
         )
         data = _flat_cache_data_config(
-            ctx=ctx, validation=validation, tokenizer=tokenizer, train_cache_dir=train_cache_dir
+            ctx=ctx,
+            validation=validation,
+            tokenizer=tokenizer,
+            train_caches=train_caches if train_caches is not None else {"train": train_cache_dir},
         )
         return GrugRunConfig(
             model=model,
@@ -411,14 +431,14 @@ def build_h100_ladder_run(
                 if no_eval
                 else GrugEvalConfig(
                     steps_per_eval=steps_per_eval,
-                    eval_batch_size=rung.global_device_count,
+                    eval_batch_size=global_device_count,
                     compute_bpb=True,
                     dropless_eval=True,
                     dropless_eval_moe_implementation="sonic",
                 )
             ),
             stop_after_steps=num_steps,
-            processes_per_task=rung.gpus_per_task,
+            processes_per_task=rung.gpus_per_task if accelerator == "H100" else 1,
             max_retries_failure=MAX_RETRIES_FAILURE,
             max_task_failures=MAX_TASK_FAILURES,
         )

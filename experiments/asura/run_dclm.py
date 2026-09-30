@@ -60,6 +60,18 @@ class RunSettings:
     training: TrainingSettings
 
 
+@dataclass(frozen=True)
+class GcpWorkerSettings:
+    project: str
+    zone: str
+    bucket: str
+    prefix: str
+    cpu_vm: str
+    tpu_vm: str
+    accelerator: str
+    wandb_entity: str
+
+
 def load_settings(path: Path) -> RunSettings:
     raw = yaml.safe_load(path.read_text())
     data = raw["data"]
@@ -105,7 +117,7 @@ class SshJobHandle:
 class GcpSshClient:
     """Dispatch Marin's CPU and TPU steps from this machine to dedicated GCP VMs."""
 
-    def __init__(self, settings: RunSettings):
+    def __init__(self, settings: GcpWorkerSettings):
         self.settings = settings
 
     def submit(self, request: JobRequest, adopt_existing: bool = True) -> SshJobHandle:
@@ -113,7 +125,7 @@ class GcpSshClient:
         if request.entrypoint.callable_entrypoint is None:
             raise ValueError("The asura dispatcher requires a callable Marin job")
         device = request.resources.device
-        if device.kind == "tpu" and device.variant != self.settings.training.accelerator:
+        if device.kind == "tpu" and device.variant != self.settings.accelerator:
             raise ValueError(f"Unexpected TPU request: {device.variant}")
         if device.kind not in {"cpu", "tpu"}:
             raise ValueError(f"Unsupported worker type: {device.kind}")
@@ -134,7 +146,7 @@ class GcpSshClient:
         quoted_payload = shlex.quote(remote_payload)
         quoted_prefix = shlex.quote(self.settings.prefix)
         quoted_bucket = shlex.quote(self.settings.bucket)
-        quoted_entity = shlex.quote(self.settings.training.wandb_entity)
+        quoted_entity = shlex.quote(self.settings.wandb_entity)
         remote_command = (
             "set -e; "
             f"gcloud storage cp {quoted_uri} {quoted_payload}; "
@@ -192,7 +204,17 @@ def main() -> None:
         sample_count=None,
         resources=ResourceConfig.with_cpu(cpu=16, ram="60g", disk="80g"),
     )
-    with set_current_client(GcpSshClient(settings)):
+    worker_settings = GcpWorkerSettings(
+        project=settings.project,
+        zone=settings.zone,
+        bucket=settings.bucket,
+        prefix=settings.prefix,
+        cpu_vm=settings.cpu_vm,
+        tpu_vm=settings.tpu_vm,
+        accelerator=training.accelerator,
+        wandb_entity=training.wandb_entity,
+    )
+    with set_current_client(GcpSshClient(worker_settings)):
         built_data = resolve(data, max_concurrent=1)
         available_tokens = built_data.num_train_tokens
         print(f"Distinct DCLM tokens in cache: {available_tokens:,}", flush=True)
