@@ -142,11 +142,12 @@ which trained on the Hero mix.
 
 ```sh
 config=experiments/asura/fast_track_dense_ladder.yaml
-uv run python -m experiments.asura.tpu_slice create --config $config
-WANDB_API_KEY=... uv run python -m experiments.asura.tpu_slice setup --config $config
-uv run python -m experiments.asura.run_fast_track --config $config --size d768 --run-id <run-id>
-uv run python -m experiments.asura.tpu_slice delete --config $config
+WANDB_API_KEY=... uv run python -m experiments.asura.tpu_queue --config $config --size d768 \
+    --variant dense --variant mid2-grt
 ```
 
-`setup` copies this checkout, including uncommitted edits, to every host; rerun it after changing code.
-Keep the controller running until the job finishes, and delete the slice when you are done.
+The queue creates the slice, copies this checkout to every host (including uncommitted edits), trains the
+runs in order, and deletes the slice. Every slice stops billing on its own, even if the controller loses its
+connection: each host powers off at a stop time of 1.5x the queue's estimated length, or after 20 minutes
+without a training run. `experiments.asura.tpu_slice` creates, sets up, and deletes a slice by hand.
+`experiments.asura.tune_fast_track` tunes a rung's optimizer, dense or looped, with Vizier, one queue per round.

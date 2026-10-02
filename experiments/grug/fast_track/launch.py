@@ -14,7 +14,7 @@ import math
 import os
 import shlex
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 from enum import StrEnum
 
@@ -42,6 +42,7 @@ from experiments.datasets.uncheatable import uncheatable_datasets
 from experiments.grug.checkpointing import RESTORE_BARRIER_TIMEOUT
 from experiments.grug.fast_track.heuristic import MoeHeuristic
 from experiments.grug.fast_track.model import GrugModelConfig
+from experiments.grug.fast_track.optimizer import GrugMoeMuonHConfig
 from experiments.grug.fast_track.train import (
     GrugEvalConfig,
     GrugRunConfig,
@@ -274,6 +275,9 @@ def build_h100_ladder_run(
     vocab_size: int = V16384_VOCAB,
     no_eval: bool = False,
     dense: bool = False,
+    model_variant: Callable[[GrugModelConfig], GrugModelConfig] | None = None,
+    optimizer_variant: Callable[[GrugMoeMuonHConfig], GrugMoeMuonHConfig] | None = None,
+    seed: int = 0,
     save_checkpoints: bool = False,
     resume_save_interval: timedelta = RESUME_SAVE_INTERVAL,
 ) -> ArtifactStep[ThroughputResult]:
@@ -281,8 +285,10 @@ def build_h100_ladder_run(
 
     Budget resolution (see ``MatchMode``): ``batch_size`` defaults to the rung's baseline batch;
     ``num_steps`` overrides the step count directly, else it is derived to data- or compute-match the
-    variant's baseline at that batch. Evaluation runs at the midpoint and end. Permanent checkpoints
-    default to the final step, with rolling recovery checkpoints on region-local temporary storage.
+    variant's baseline at that batch. ``model_variant`` rewrites the rung's model without moving that
+    baseline budget, and ``optimizer_variant`` rewrites the heuristic's optimizer. ``seed`` sets the model
+    initialization and the data order. Evaluation runs at the midpoint and end. Permanent checkpoints default
+    to the final step, with rolling recovery checkpoints on region-local temporary storage.
     """
     if not run_id.strip():
         raise ValueError("run_id must not be empty")
@@ -299,6 +305,8 @@ def build_h100_ladder_run(
 
     rung = _h100_ladder_rung(size)
     model = dataclasses.replace(_h100_ladder_model(rung, dense=dense), vocab_size=vocab_size)
+    if model_variant is not None:
+        model = model_variant(model)
     mp_policy = "params=float32,compute=bfloat16,output=bfloat16"
     train_resources = (
         ResourceConfig.with_gpu("H100", count=rung.gpus_per_task, cpu=32, ram="600g", disk="900g")
@@ -351,6 +359,8 @@ def build_h100_ladder_run(
         hidden_dim=model.hidden_dim,
         seq_len=SEQ_LEN,
     )
+    if optimizer_variant is not None:
+        optimizer = optimizer_variant(optimizer)
     grug_trainer = GrugTrainerConfig(
         data_seed=None,
         log_every=1,
@@ -376,7 +386,7 @@ def build_h100_ladder_run(
         temporary_checkpoint_path = temporary_checkpoint_base_path(ctx.output_path)
         trainer = TrainerConfig(
             id=run_id,
-            seed=0,
+            seed=seed,
             train_batch_size=batch_size,
             num_train_steps=num_steps,
             jax_config=dict(DEFAULT_JAX_CONFIG),

@@ -1,0 +1,14 @@
+# Vizier and its JAX extra beside the project environment: uv run --with-requirements <this file> ...
+# The extra pins an old equinox, which only the root project's override lifts, so its packages are listed directly at
+# their uv.lock versions, except flax: the locked 0.12.4 calls an API that JAX 0.11 removed.
+google-vizier==0.1.24
+tfp-nightly[jax]==0.26.0.dev20260304
+chex==0.1.91
+equinox==0.13.2
+flax==0.12.10
+jax==0.11.1
+jaxlib==0.11.1
+jaxopt==0.8.5
+jaxtyping==0.3.5
+optax==0.2.6
+typeguard==2.13.3

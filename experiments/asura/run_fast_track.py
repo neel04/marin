@@ -8,7 +8,10 @@ results are in docs/experiments/ledger.md.
 """
 
 import argparse
+import dataclasses
+import json
 import os
+from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
 
@@ -23,9 +26,43 @@ from experiments.asura.run_dclm import GcpSshClient, GcpWorkerSettings
 from experiments.datasets.paloma import paloma_datasets
 from experiments.datasets.uncheatable import UNCHEATABLE_SUBSETS
 from experiments.grug.fast_track.launch import H100_LADDER_SIZES, build_h100_ladder_run
+from experiments.grug.fast_track.optimizer import GrugMoeMuonHConfig
+from experiments.grug.looped.model import VARIANTS
 
 # Spot slices can be preempted, so keep recovery checkpoints close together.
 RESUME_SAVE_INTERVAL = timedelta(minutes=15)
+
+
+@dataclass(frozen=True)
+class OptimizerTrial:
+    """One tuning trial's optimizer: multipliers on the heuristic's learning rates, and absolute settings."""
+
+    lr_multiplier: float
+    adam_lr_multiplier: float
+    momentum: float
+    beta1: float
+    beta2: float
+    warmup: float
+    decay: float
+    min_lr_ratio: float
+
+    @staticmethod
+    def from_json(text: str) -> "OptimizerTrial":
+        return OptimizerTrial(**json.loads(text))
+
+    def apply(self, config: GrugMoeMuonHConfig) -> GrugMoeMuonHConfig:
+        """The heuristic's ``config`` with this trial's settings: its learning rates scaled, the rest replaced."""
+        return dataclasses.replace(
+            config,
+            learning_rate=config.learning_rate * self.lr_multiplier,
+            adam_lr=config.adam_lr * self.adam_lr_multiplier,
+            momentum=self.momentum,
+            beta1=self.beta1,
+            beta2=self.beta2,
+            warmup=self.warmup,
+            decay=self.decay,
+            min_lr_ratio=self.min_lr_ratio,
+        )
 
 
 def validation_sets(tokenizer: str, config: dict) -> list[ArtifactStep]:
@@ -91,16 +128,31 @@ def main() -> None:
         type=int,
         help="Short probe run without permanent checkpoints. Omit for the data-matched rung.",
     )
+    parser.add_argument(
+        "--variant",
+        choices=sorted(VARIANTS),
+        help="Looped model variant from experiments.grug.looped.model. Omit for the dense reference.",
+    )
+    parser.add_argument(
+        "--optimizer-trial",
+        type=OptimizerTrial.from_json,
+        help="OptimizerTrial fields as JSON. Omit for the heuristic optimizer.",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="Model initialization and data order")
     args = parser.parse_args()
     config = yaml.safe_load(args.config.read_text())
 
     os.environ["MARIN_CLUSTER"] = "asura"
     os.environ["MARIN_PREFIX"] = config["prefix"]
     os.environ["MARIN_TEMP_PREFIX"] = config["bucket"]
+
     run = build_h100_ladder_run(
         run_id=args.run_id,
         size=args.size,
         dense=True,
+        model_variant=VARIANTS[args.variant] if args.variant else None,
+        optimizer_variant=args.optimizer_trial.apply if args.optimizer_trial else None,
+        seed=args.seed,
         accelerator=config["accelerator"],
         tokenizer=config["tokenizer"],
         train_caches={"dclm": config["train_cache"]},
@@ -112,7 +164,8 @@ def main() -> None:
         save_checkpoints=args.num_steps is None,
         resume_save_interval=RESUME_SAVE_INTERVAL,
     )
-    print(f"Launching {args.run_id}: {args.size} on {config['accelerator']}", flush=True)
+
+    print(f"Launching {args.run_id}: {args.size} {args.variant or 'reference'} on {config['accelerator']}", flush=True)
     with set_current_client(GcpSshClient(worker_settings(config))):
         resolve(run, max_concurrent=1)
 

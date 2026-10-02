@@ -6,7 +6,11 @@
 A multi-host slice is a GCE managed instance group of TPU VMs bound by a workload policy. ``setup`` ships
 this checkout, the asura cluster config, and ``$WANDB_API_KEY`` to every host, then installs the environment.
 
-    uv run python -m experiments.asura.tpu_slice {create,setup,delete} --config <config.yaml>
+Every slice stops billing on its own: ``slice_watchdog.sh`` powers each host off at the ``--stop-at`` time given
+to ``create``, or once no training worker has run on it for a while.
+
+    uv run python -m experiments.asura.tpu_slice create --config <config.yaml> --stop-at <RFC 3339 time>
+    uv run python -m experiments.asura.tpu_slice {setup,delete} --config <config.yaml>
 """
 
 import argparse
@@ -17,6 +21,7 @@ import tempfile
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -33,6 +38,7 @@ IMAGE_FAMILY = "ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e"
 IMAGE_PROJECT = "ubuntu-os-accelerator-images"
 READY_TIMEOUT = 30 * 60
 REPO = Path(__file__).resolve().parents[2]
+WATCHDOG = Path(__file__).with_name("slice_watchdog.sh")
 CLUSTER_CONFIG = Path.home() / ".config/marin/clusters/asura.yaml"
 
 
@@ -45,9 +51,13 @@ def names(settings: GcpWorkerSettings) -> tuple[str, str, str]:
     return settings.zone.rsplit("-", 1)[0], f"{settings.tpu_vm}-policy", f"{settings.tpu_vm}-tpl"
 
 
-def create(settings: GcpWorkerSettings) -> None:
+def create(settings: GcpWorkerSettings, stop_at: datetime) -> None:
+    if stop_at <= datetime.now(UTC):
+        raise ValueError(f"Stop time {stop_at.isoformat()} is not in the future")
+
     machine_type, topology, host_count = SLICES[settings.accelerator]
     region, policy, template = names(settings)
+
     gcloud(
         settings,
         *("compute", "resource-policies", "create", "workload-policy", policy),
@@ -55,7 +65,9 @@ def create(settings: GcpWorkerSettings) -> None:
         "--type=high-throughput",
         f"--accelerator-topology={topology}",
     )
-    # Spot templates in a managed instance group must stop, not delete, on preemption.
+
+    # Spot templates in a managed instance group must stop, not delete, on preemption, and cannot carry a GCE
+    # termination time, so the watchdog stops each host. The do-nothing failure policy keeps stopped hosts stopped.
     gcloud(
         settings,
         *("alpha", "compute", "instance-templates", "create", template),
@@ -63,11 +75,14 @@ def create(settings: GcpWorkerSettings) -> None:
         "--maintenance-policy=TERMINATE",
         "--provisioning-model=SPOT",
         "--instance-termination-action=STOP",
+        f"--metadata=stop-at={stop_at.isoformat()}",
+        f"--metadata-from-file=startup-script={WATCHDOG}",
         f"--image-family={IMAGE_FAMILY}",
         f"--image-project={IMAGE_PROJECT}",
         "--boot-disk-size=100GB",
         "--scopes=cloud-platform",
     )
+
     gcloud(
         settings,
         *("alpha", "compute", "instance-groups", "managed", "create", settings.tpu_vm),
@@ -78,12 +93,22 @@ def create(settings: GcpWorkerSettings) -> None:
         "--default-action-on-vm-failure=do-nothing",
         f"--workload-policy=projects/{settings.project}/regions/{region}/resourcePolicies/{policy}",
     )
+
+    hosts = _wait_until_ready(settings, host_count)
+    print(f"{settings.tpu_vm} ready: {', '.join(hosts)}", flush=True)
+
+
+def _wait_until_ready(settings: GcpWorkerSettings, host_count: int) -> list[str]:
+    """The slice's hosts, once at least ``host_count`` of them run and accept SSH."""
     deadline = time.monotonic() + READY_TIMEOUT
-    while len(hosts := tpu_hosts(settings)) < host_count or not all(_reachable(settings, h) for h in hosts):
+    while True:
+        hosts = tpu_hosts(settings)
+        if len(hosts) >= host_count and all(_reachable(settings, host) for host in hosts):
+            return hosts
+
         if time.monotonic() > deadline:
             raise TimeoutError(f"{settings.tpu_vm} not ready after {READY_TIMEOUT}s; delete it to stop billing")
         time.sleep(20)
-    print(f"{settings.tpu_vm} ready: {', '.join(hosts)}", flush=True)
 
 
 def _reachable(settings: GcpWorkerSettings, host: str) -> bool:
@@ -138,19 +163,39 @@ def _archive_checkout(archive: Path) -> None:
 
 
 def delete(settings: GcpWorkerSettings) -> None:
+    """Delete whichever parts of the slice exist."""
     region, policy, template = names(settings)
-    gcloud(settings, "compute", "instance-groups", "managed", "delete", settings.tpu_vm, f"--zone={settings.zone}")
-    gcloud(settings, "compute", "instance-templates", "delete", template)
-    gcloud(settings, "compute", "resource-policies", "delete", policy, f"--region={region}")
+    # The instance group goes first: it uses the template and the policy.
+    deletions = [
+        ("instance-groups", "managed", "delete", settings.tpu_vm, f"--zone={settings.zone}"),
+        ("instance-templates", "delete", template),
+        ("resource-policies", "delete", policy, f"--region={region}"),
+    ]
+
+    for deletion in deletions:
+        command = ["gcloud", "compute", *deletion, f"--project={settings.project}", "--quiet"]
+        result = subprocess.run(command, capture_output=True, text=True)
+
+        if result.returncode != 0 and "was not found" not in result.stderr:
+            raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("create", "setup", "delete"))
     parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument("--stop-at", type=datetime.fromisoformat, help="RFC 3339 time at which create's hosts stop")
     args = parser.parse_args()
     settings = worker_settings(yaml.safe_load(args.config.read_text()))
-    {"create": create, "setup": setup, "delete": delete}[args.action](settings)
+
+    if args.action == "setup":
+        setup(settings)
+    elif args.action == "delete":
+        delete(settings)
+    elif args.stop_at is None or args.stop_at.tzinfo is None:
+        parser.error("create needs --stop-at with a UTC offset, so every slice stops billing on its own")
+    else:
+        create(settings, args.stop_at)
 
 
 if __name__ == "__main__":

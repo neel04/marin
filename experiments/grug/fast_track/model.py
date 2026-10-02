@@ -4,6 +4,7 @@
 """Expert-parallel MoE grug variant model."""
 
 import dataclasses
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import equinox as eqx
@@ -736,6 +737,37 @@ def _long_layer_schedule(num_layers: int, global_every: int) -> jax.Array:
     return (((layer_indices + 1) % global_every) == 0) | (layer_indices == num_layers - 1)
 
 
+def _layer_masks(
+    mask: AttentionMask | jax.Array, cfg: GrugModelConfig, batch_size: int, seq_len: int
+) -> Callable[[jax.Array], AttentionMask]:
+    """The attention mask of one scanned layer: full causal when ``use_long``, else the sliding window.
+
+    The FA4 per-token bounds of both kinds are computed once, outside the layer scan.
+    """
+    segment_ids = None
+    if isinstance(mask, AttentionMask) and mask.segment_ids is not None:
+        # Pin the [B, S] segment ids batch-sharded and reuse one array for both attention sides.
+        q_segment_ids, _ = mask.segment_ids
+        q_segment_ids = _batch_reshard(q_segment_ids)
+        segment_ids = (q_segment_ids, q_segment_ids)
+    short_mask = AttentionMask(is_causal=True, sliding_window=cfg.sliding_window, segment_ids=segment_ids)
+    long_mask = AttentionMask(is_causal=True, sliding_window=None, segment_ids=segment_ids)
+    long_lower_bounds, valid = fa4_cute_segment_bounds(
+        long_mask, batch_size=batch_size, seq_len=seq_len, sliding_window=None
+    )
+    short_lower_bounds, _ = fa4_cute_segment_bounds(
+        short_mask, batch_size=batch_size, seq_len=seq_len, sliding_window=cfg.sliding_window
+    )
+    long_lower_bounds = _batch_reshard(long_lower_bounds)
+    short_lower_bounds = _batch_reshard(short_lower_bounds)
+    valid = _batch_reshard(valid)
+
+    def mask_for_layer(use_long: jax.Array) -> AttentionMask:
+        return long_mask.with_fa4_bounds(jnp.where(use_long, long_lower_bounds, short_lower_bounds), valid)
+
+    return mask_for_layer
+
+
 class Transformer(eqx.Module):
     token_embed: jax.Array
     embed_norm: RMSNorm
@@ -775,7 +807,7 @@ class Transformer(eqx.Module):
             _init_weight(out_key, (cfg.hidden_dim, cfg.vocab_size), cfg.initializer_std), _LM_HEAD_PARTITION_SPEC
         )
         stacked_blocks = ArrayStacked.init(cfg.num_layers, Block)(cfg, key=jnp.stack(block_keys))
-        return Transformer(
+        return cfg.model_type(
             token_embed=token_embed,
             embed_norm=RMSNorm.init(cfg.hidden_dim, cfg.layer_norm_eps),
             embed_gated_norm=GatedNorm.init(cfg.hidden_dim, cfg.initializer_std, key=embed_gn_key),
@@ -804,28 +836,10 @@ class Transformer(eqx.Module):
         hidden = self.embed_gated_norm(self.embed_norm(hidden))
 
         # Local layers use a sliding window; every global_every-th layer is full causal.
-        segment_ids = None
-        if isinstance(mask, AttentionMask) and mask.segment_ids is not None:
-            # Pin the [B, S] segment ids batch-sharded and reuse one array for both attention sides.
-            q_segment_ids, _ = mask.segment_ids
-            q_segment_ids = _batch_reshard(q_segment_ids)
-            segment_ids = (q_segment_ids, q_segment_ids)
-        short_mask = AttentionMask(is_causal=True, sliding_window=cfg.sliding_window, segment_ids=segment_ids)
-        long_mask = AttentionMask(is_causal=True, sliding_window=None, segment_ids=segment_ids)
-
+        batch_size, seq_len = hidden.shape[0], hidden.shape[1]
+        mask_for_layer = _layer_masks(mask, cfg, batch_size, seq_len)
         # One compiled Block body scanned over the stacked layers; per-layer short/long is a Bool[num_layers] scan input.
         mask_schedule = _long_layer_schedule(cfg.num_layers, cfg.global_every)
-        # Precompute FA4 per-token metadata for long/short layers outside the scan; select per layer with jnp.where.
-        batch_size, seq_len = hidden.shape[0], hidden.shape[1]
-        long_lower_bounds, valid = fa4_cute_segment_bounds(
-            long_mask, batch_size=batch_size, seq_len=seq_len, sliding_window=None
-        )
-        short_lower_bounds, _ = fa4_cute_segment_bounds(
-            short_mask, batch_size=batch_size, seq_len=seq_len, sliding_window=cfg.sliding_window
-        )
-        long_lower_bounds = _batch_reshard(long_lower_bounds)
-        short_lower_bounds = _batch_reshard(short_lower_bounds)
-        valid = _batch_reshard(valid)
 
         def _scan_layers(
             carry_hidden: Float[Array, "B S D"],
@@ -833,11 +847,9 @@ class Transformer(eqx.Module):
         ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
             layer, layer_use_long_mask = scan_inputs
             use_long = jnp.asarray(layer_use_long_mask, dtype=jnp.bool_)
-            lower_bounds = jnp.where(use_long, long_lower_bounds, short_lower_bounds)
-            layer_mask = long_mask.with_fa4_bounds(lower_bounds, valid)
             return eqx.filter_checkpoint(layer, policy=_REMAT_POLICY)(
                 carry_hidden,
-                layer_mask,
+                mask_for_layer(use_long),
                 use_long,
                 use_long,
             )

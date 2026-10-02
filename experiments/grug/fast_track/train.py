@@ -504,7 +504,7 @@ def initial_state(
     key: PRNGKeyArray,
     ema_beta: float | None = None,
 ) -> GrugTrainState:
-    initialized_params = Transformer.init(model_config, key=key)
+    initialized_params = model_config.model_type.init(model_config, key=key)
     num_moe_layers = model_config.num_layers
     params = mp.cast_to_param(initialized_params)
     master_params = None
