@@ -14,7 +14,8 @@ Wall time is the W&B run duration. It excludes slice provisioning and worker set
 |------|-----|-------:|------------:|-----------:|----------------:|---------:|----:|----------:|
 | d768 | reference ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-dense-d768-dclmbpe-v5p32-20260928)) | 1.07B | 3.2548 | 1.3275 | 1.1478 | 4.25M | 33.9% | 6.0 min |
 | d768 | reference, tuned optimizer‡ ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-tune20261001-t022-d768-dclmbpe-v5p32)) | 1.07B | 3.2431 | 1.3230 | 1.1444 | 4.28M | 34.1% | 5.9 min |
-| d768 | best looped, `mid2-grt` with tuned optimizer§ ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-tunegrt20261002-t026-d768-dclmbpe-v5p32)) | 1.07B | 3.2431 | 1.3225 | 1.1416 | 4.06M | 32.4% | 6.4 min |
+| d768 | looped, `mid2-grt-grow`§ ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-mid2-grt-grow-t26-d768-dclmbpe-v5p32-20261003r4)) | 1.07B | 3.2287 | 1.3169 | 1.1396 | 3.94M | 33.7% | 6.9 min |
+| d768 | best, gated middle block, `mid4-grt-grow`§ ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-mid4-grt-grow-t26-d768-dclmbpe-v5p32-20261003r13)) | 1.07B | 3.2150 | 1.3111 | 1.1296 | 3.96M | 34.0% | 6.8 min |
 | d1024 | reference ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-dense-d1024-dclmbpe-v5p32-20260928)) | 2.89B | 2.9897 | 1.2219 | 1.0193 | 2.11M | 38.6% | 25.2 min |
 
 ‡The tuned-optimizer row is the best of a 28-trial [Vizier](https://github.com/google/vizier) sweep (GP-UCB-PE,
@@ -37,44 +38,152 @@ deviations of a single run, and the reference has only run with seed 0, so compa
 row until the reference's own seeds confirm the gain. Seed runs are
 [`fasttrack-tune20261001-t022-s{1..4}-d768-dclmbpe-v5p32`](https://wandb.ai/neel/marin/runs/fasttrack-tune20261001-t022-s1-d768-dclmbpe-v5p32).
 
-§Looped variants come from
+§These rows come from
 [`experiments/grug/looped/model.py`](https://github.com/marin-community/marin/blob/main/experiments/grug/looped/model.py)
-and are launched with `--variant`. They execute the rung's 8 layers at the reference's FLOPs per token but store
-fewer blocks. `mid2-grt` keeps the first and last two layers unique and runs one shared two-block core twice (6
-distinct blocks, 71M parameters to the reference's 82M), with the gated update of the
-[Gated Recurrent Transformer](https://arxiv.org/abs/2608.15062): each pass runs the core on a projection of the state
-and the prelude output, and a gate that starts near 0.98 blends the core's output into the state. The projection and
-gate add compute that the trainer's FLOP count, and so its MFU, leaves out.
+and are launched with `--variant`. All of them use the optimizer of a 28-trial Vizier sweep of `mid2-grt`
+(`tune_fast_track --variant mid2-grt`, the dense sweep's search space): MuonH LR 1.01x the heuristic, Adam LR 3.98x,
+Muon momentum 0.98, beta1 0.80, beta2 0.993, 0.1% warmup, decay over the final 99% of steps, and a minimum
+learning-rate ratio of 0.0007. FLOPs per token include every added projection and grown pass, so the MFU column is
+comparable with the references'. Tokens/s and MFU on these rows are whole-run means, since the grown passes run only
+in the last steps.
 
-With the heuristic optimizer, `mid2-grt` scores 3.2627
-([W&B](https://wandb.ai/neel/marin/runs/fasttrack-mid2-grt-d768-dclmbpe-v5p32-20261002)). A 28-trial Vizier sweep of
-its optimizer (`tune_fast_track --variant mid2-grt`, the same search space as the dense sweep) found the row's
-settings: MuonH LR 1.01x the heuristic, Adam LR 3.98x, Muon momentum 0.98, beta1 0.80, beta2 0.993, 0.1% warmup,
-decay over the final 99% of steps, and a minimum learning-rate ratio of 0.0007. Two other trials in the same region,
-with Adam LR 3.8x to 4x and momentum 0.98, scored 3.2452 and 3.2490. The row beats the reference by 0.0117, which the
-reference recipe would need 1.07x the compute to match, an effective speedup of 1.02 after the 4% throughput cost.
-It is one seed, and it ties the tuned dense optimizer's seed 0 (3.2431), whose five-seed mean is 3.2488. Adam LR,
-momentum, and beta1 sit at the edges of the search space, and the dense sweep never tried Adam LR above 3x, so
-whether looping or the optimizer settings carry the gain needs seed replicates and the same settings on the dense
-reference.
+- `mid2-grt` keeps the first and last two layers unique and runs one shared two-block core twice, with the gated
+  update of the [Gated Recurrent Transformer](https://arxiv.org/abs/2608.15062): each pass runs the core on a
+  projection of the state and the prelude output, and a gate that starts near 0.98 blends the core's output into the
+  state. It stores 6 of the reference's 8 blocks.
+- `mid4-grt` keeps all 8 blocks distinct and wraps the middle four in one gated pass of the same update.
+- `-pool` adds each pass's change to a pool the coda reads, in place of the gated update; see below.
+- `-grow` adds a pass over the same core and gate for the last 10% of steps, and evaluates with it. The FLOPs below
+  are training FLOPs; evaluation, like any later use of the model, runs every pass, at 1.27x the reference's forward
+  FLOPs for `mid2-grt-grow` and 1.48x for `mid4-grt-grow`.
 
-What the looped runs established, each from one seed (single-run differences under about 0.01 are noise):
-- Distinct blocks matter most; each comparison below keeps the gating fixed. Two plain passes over all 4 shared
-  blocks (`loop2`, 3.3242) trail plain 2 + 2×2 + 2 (`mid2`, 3.2852) by 0.039. Three Hyperloop passes over a 2-block
-  core between unique first and last layers (`mid3-hyper`, 3.2965) trail `mid2-hyper` (3.2696) by 0.027. A
-  1 + 3×2 + 1 split with the GRT gate, which stores 5 blocks, trails `mid2-grt` by 0.014 (3.2771).
-- A gate around the loop is worth about 0.02 over a plain loop (`mid2`, 3.2852): GRT gives 3.2627 and the
-  hyper-connections of [Hyperloop](https://arxiv.org/abs/2604.21254) give 3.2696, within noise of each other. The
-  code keeps GRT, the simpler of the two and the better in every comparison.
-- Within noise or worse: adding the loop input back before each pass, sharing only the attention and MLP matrices,
-  [SMELT](https://arxiv.org/abs/2609.01343)'s 1/r scaling of looped updates (3.2781 on `mid2`, 3.2701 on
-  `mid2-hyper`), and [ASURA](https://neel04.github.io/my-website/projects/asura/)'s per-iteration projections,
-  adapters, norms, and multi-pass loss (3.3269 to 3.3356 on `mid3`).
+With one optimizer (the sweep's above) for every model on seed 0, against the reference recipe with that optimizer
+(FLOPs relative to the reference):
+
+| Model | Paloma loss | FLOPs |
+|-------|------------:|------:|
+| Dense | 3.2352 | 1.000x |
+| Looped, `mid2-grt` | 3.2368 | 1.048x |
+| Looped and grown, `mid2-grt-grow` | 3.2287 | 1.070x |
+| Gated middle block, `mid4-grt` | 3.2241 | 1.030x |
+| Gated middle block, grown, `mid4-grt-grow` | 3.2150 | 1.076x |
+| Pooled middle block, grown, `mid4-pool-grow` | **3.2127** | 1.070x |
+
+- **The gated update is the main gain, not the sharing.** Around a distinct middle block it is worth 0.011. Sharing
+  the core across two passes gives up 0.013 of it.
+- **Growth adds 0.007 to 0.014** on every model and seed tried. One extra pass for the last 10% is enough: a third
+  for the last 20%, or a fourth, gains nothing more.
+- **The gate needs unique layers around it.** With a key-value head per query head, gating the middle six blocks or
+  all eight scored 0.012 and 0.032 worse than gating the middle four.
+- **The tuned dense optimizer is not the gap.** The sweep's optimizer above improves the reference by 0.008.
+- A key-value head per query head in every layer improves the dense and looped models alike by 0.023 to 0.038, at
+  about 1.08x the FLOPs, and the gated middle block keeps its lead with it (3.1790 against 3.2126). It changes the
+  reference recipe, so its runs (`dense-mha` and the `-allmha` variants) stay out of this ledger.
+
+Over seeds, which change the initialization and the data order (the dense row uses the tuned dense optimizer):
+
+| Seed | 0 | 1 | 2 | Mean |
+|------|--:|--:|--:|-----:|
+| Dense | 3.2431 | 3.2492 | 3.2459 | 3.2461 |
+| Looped and grown (`mid2-grt-grow`) | 3.2287 | 3.2364 | 3.2327 | 3.2326 |
+| Gated middle block (`mid4-grt`) | 3.2241 | 3.2229 | | 3.2235 |
+| Gated middle block, grown (`mid4-grt-grow`) | 3.2150 | 3.2178 | | 3.2164 |
+
+On both seeds it ran, the gated middle block beats the tuned dense run of the same seed. Grown, it gains 0.028 and
+0.031, which dense would need 1.18x and 1.20x the compute to match, for 1.076x the FLOPs. Without growth it gains
+0.019 and 0.026, worth 1.12x and 1.17x, for 1.030x the FLOPs and at 95% of the reference's throughput.
+
+The string ensembles of [neel04/loop](https://github.com/neel04/loop) split the core into narrow private copies,
+strings, each with its own key-value head, that all refine the shared state each pass. At d768 they add nothing that
+the extra key-value heads do not: two gated strings, grown, score 3.2230, and one gated core with two key-value heads,
+grown, 3.2233 at the same FLOPs. Reading six ungated strings out as a mixture scores 3.2358 at half the reference's
+throughput. A port of the loop repo's refiner, narrowed to keep its compute under 10% of the reference's, changes no
+gated rung by more than 0.004; its full-state restarts through the narrow latent cost 0.028, and re-anchoring the
+strings on the refined state gains nothing. Two strings in the gated middle block, grown, score 3.2186 against
+3.2150 for one core, at 65% of its throughput.
+
+Training the strings to explore different hypotheses, after [Explorative Modeling](https://arxiv.org/abs/2607.27372),
+hurt or did nothing. Every string's output after every pass was a hypothesis, decoded at every 32nd position by the
+output head after a learned norm, or after a tuned lens in the later runs. Only the hypothesis that predicted a token
+best got credit.
+- **Crediting the winning strings made them hedge.** At weight 0.25 the best of the hypotheses reached 2.4 nats,
+  while the strings' average, which the model reads, lost 0.17 (3.3897). At weight 0.03 it still lost 0.015.
+- **Training only the refiner on that credit changed nothing.** Its proposals were detached from the next-token
+  loss. It tied the jointly trained refiner: 3.2258 against 3.2225 and, in the gated middle block, 3.2195 against
+  3.2186.
+- **The model turned the proposals off.** The next-token loss scaled them to a gain of 0.01 to 0.02, against 0.15
+  for the jointly trained refiner.
+- **The exploration loss cost up to 19% of throughput.**
+- **Choosing among the strings does not rescue the credit.** In place of the strings' average, a learned selector
+  weighed each pass's strings from a query on the state and a key on each string. With the exploration loss it still
+  lost 0.16 to 0.17 (3.3788 and 3.3912), whether or not it was also trained to pick each pass's winner. It picked
+  the winner 62% of the time against 50% by chance, because the winner is the string that bet on the token that came
+  next, which the context does not reveal. On its own, without the exploration loss, the selector stayed near an
+  even average (3.2298).
+- **Mixing the strings' distributions does not rescue it either.** The loop repo's readout mixes the strings'
+  next-token distributions with a contextual prior, and here each string also had its own refiner. Credited by the
+  winner, each string's own loss reached 7.2 to 9.2 nats, while the prior stayed near even: 3.3446 with two strings
+  and 3.4199 with three. With the loop repo's proportional credit, the uniform mixture's likelihood, the prior also
+  stayed even and the mixture about matched the fused readout's 3.2225: 3.2297 with one shared refiner, 3.2194 with
+  each of two strings proposed by its own refiner (`mid2-grt-str2-uref-mix-grow`, 1.14x the reference's FLOPs), and
+  3.2346 with three, at 59% to 70% of the fused readout's throughput.
+
+What else was tried on the readout and the strings, each from one seed:
+- **The track-record mixture** (two strings, each proposed by its own refiner, mixed by a prior that also weighs each
+  string's record on the document's earlier tokens, trained on the deployed mixture's likelihood): 3.2105 at 1.15x
+  the FLOPs, against 3.2149 for the same mixture without the record. Its prior picks the string that predicts the
+  next token best 64% of the time, against 54% without the record, but one string takes 72% of the weight.
+- **Children of those strings**, born at 90% of training from their parents' refiners and run in parallel with them:
+  3.2197 at 1.25x the FLOPs, 0.009 worse than the mixture without children.
+- **Candidate tokens from a proposal head**, each verified by one string: 3.2179.
+- **Each string's surprise, fed back between rounds**: a lens read each string's next-token loss on the document's
+  earlier tokens before the last round, and the last round's refiners and commit read it. Measured at every position,
+  every fourth, or the document's rare tokens, it scored 3.2072, 3.2077 and 3.2087 at 1.32x and 1.21x the FLOPs,
+  within noise of the mixture without it. The lens's own loss was 4.4 nats against the model's 3.2.
+- **An in-context cache in the readout**, after the [neural cache](https://arxiv.org/abs/1612.04426), scored 3.1705,
+  0.044 better than the gated middle block, but nothing in it is specific to looping, so it is out of scope here.
+
+Training the rounds one at a time, so that depth would be a choice at inference, does not pay at this rung; its code
+was removed. Each step draws a depth of one to four rounds of the gated middle block, runs all but the
+last forward only, and trains the last, which starts from the prelude's output plus the earlier rounds' detached
+refinement. At four rounds it scores 3.2237 (1.26x the reference's training FLOPs), the same as one gated pass trained
+end to end (3.2241 at 1.03x) and 0.009 behind the grown one. Depth helps up to three rounds (3.2672 at one, 3.2240 at
+three), then slowly hurts (3.2290 at eight): the core learns to refine for the depths it trained at, not toward a fixed
+point. Training the last two rounds together scores 3.2396. Two narrow strings, each with its own coda, mixed by their
+records on the document's earlier tokens, lose 0.024 to 0.058: pooled by those records 3.2478, with a refiner that
+proposes once 3.2542, with a refiner per round 3.2820; the records never tell the strings apart (0.50 and 0.50).
+
+Adding each pass's work to a pool, instead of carrying a gated state (`PooledTransformer`), ties the frontier with one
+pass and loses with two shared ones. The pool starts as the prelude's output; each pass
+runs the core on the prelude's output plus a projection of the pool, and adds the core's change of its input, where the
+gate opens, to the pool, which the coda reads. Every pass's contribution then reaches the coda through additions alone:
+a residual connection across passes in place of the gated update's highway. The gated middle block grown this way,
+`mid4-pool-grow`, scores 3.2127, within noise of `mid4-grt-grow` (3.2150) at the same throughput. With two passes over
+a shared core, `mid2-pool` loses 0.0085 to `mid2-grt` (3.2411 against 3.2326), as
+[Hyperloop](https://arxiv.org/abs/2604.21254)'s ablation of an identity carry against a gated one predicts. Pooling
+after the coda, which then runs every pass, scores 3.2383 at 1.29x the FLOPs; two strings on the shared core score
+3.2345 sharing one pool and 3.2311 with a pool each, at 1.52x and 1.54x. Only the pool before the coda, with one string,
+stays in the code.
+
+Every readout that reads other positions sees only its own document, as the model's attention does: training and
+evaluation sequences pack several documents. A first version of the cache read earlier documents too and scored
+3.1590; earlier track-record runs read them as well, and none of those runs is reported.
+
+What the earlier looped runs established, each from one seed (single-run differences under about 0.01 are noise):
+- Distinct blocks matter most among shared cores. Two plain passes over all 4 shared blocks (`loop2`, 3.3242) trail
+  plain 2 + 2×2 + 2 (`mid2`, 3.2852) by 0.039, and a 1 + 3×2 + 1 split with the gate trails `mid2-grt` by 0.014.
+- A gate around the loop is worth about 0.02 over a plain loop with the heuristic optimizer; the hyper-connections of
+  [Hyperloop](https://arxiv.org/abs/2604.21254) give about the same.
+- Within noise or worse: adding the loop input back before each pass or before the coda, sharing only the attention
+  and MLP matrices, [SMELT](https://arxiv.org/abs/2609.01343)'s 1/r scaling,
+  [ASURA](https://neel04.github.io/my-website/projects/asura/)'s per-iteration projections and multi-pass loss, the
+  loop repo's strands, refiner and per-string gates, late prior credit, strings that loop different numbers of times,
+  growth on ungated strings, iso-FLOP or progressive growth schedules, and pass embeddings for the grown passes.
 - Sharing the blocks only for the first 30% of training and then untying them beat the reference (3.2415), but the
   result is an unlooped model, so it is out of scope here.
 
-Run ids follow `fasttrack-<variant>-d768-dclmbpe-v5p32-<date>` in W&B project `neel/marin`; removed variants'
-settings are in their run configs.
+Run ids follow `fasttrack-<variant>[-t22|-t26][-s<seed>]-d768-dclmbpe-v5p32-<date>` in W&B project `neel/marin`;
+removed variants' settings are in their run configs.
 
 ## Reference setup
 

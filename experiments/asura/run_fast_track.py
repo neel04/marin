@@ -105,14 +105,15 @@ def validation_sets(tokenizer: str, config: dict) -> list[ArtifactStep]:
     ]
 
 
-def worker_settings(config: dict) -> GcpWorkerSettings:
+def worker_settings(config: dict, slice_name: str | None = None) -> GcpWorkerSettings:
+    """The config's worker settings, on the slice named ``slice_name`` instead of the config's ``tpu_vm`` if given."""
     return GcpWorkerSettings(
         project=config["project"],
         zone=config["zone"],
         bucket=config["bucket"],
         prefix=config["prefix"],
         cpu_vm=config["cpu_vm"],
-        tpu_vm=config["tpu_vm"],
+        tpu_vm=slice_name or config["tpu_vm"],
         accelerator=config["accelerator"],
         wandb_entity=config["wandb_entity"],
     )
@@ -139,6 +140,12 @@ def main() -> None:
         help="OptimizerTrial fields as JSON. Omit for the heuristic optimizer.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Model initialization and data order")
+    parser.add_argument("--slice", help="Slice name, to run beside another queue; defaults to the config's tpu_vm")
+    parser.add_argument(
+        "--save-checkpoints",
+        action="store_true",
+        help="Keep a permanent final checkpoint. Off by default: a rung is cheap to rerun when one is needed.",
+    )
     args = parser.parse_args()
     config = yaml.safe_load(args.config.read_text())
 
@@ -161,12 +168,12 @@ def main() -> None:
         version=config["version"],
         wandb_entity=config["wandb_entity"],
         wandb_project=config["wandb_project"],
-        save_checkpoints=args.num_steps is None,
+        save_checkpoints=args.save_checkpoints,
         resume_save_interval=RESUME_SAVE_INTERVAL,
     )
 
     print(f"Launching {args.run_id}: {args.size} {args.variant or 'reference'} on {config['accelerator']}", flush=True)
-    with set_current_client(GcpSshClient(worker_settings(config))):
+    with set_current_client(GcpSshClient(worker_settings(config, args.slice))):
         resolve(run, max_concurrent=1)
 
 

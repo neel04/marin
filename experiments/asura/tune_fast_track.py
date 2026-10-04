@@ -29,7 +29,7 @@ from vizier.service import clients
 from vizier.service import pyvizier as vz
 
 from experiments.asura.run_fast_track import OptimizerTrial
-from experiments.asura.tpu_queue import Run, run_queue
+from experiments.asura.tpu_queue import RUN_MINUTES, Run, run_queue
 from experiments.grug.looped.model import VARIANTS
 
 logger = logging.getLogger(__name__)
@@ -105,7 +105,7 @@ class Sweep:
     def train_unfinished(self, runs: list[Run]) -> None:
         """Train, as one TPU queue, the runs that have not finished in W&B."""
         unfinished = [run for run in runs if self.final_loss(run.run_id) is None]
-        run_queue(self.config, SIZE, unfinished)
+        run_queue(self.config, SIZE, unfinished, RUN_MINUTES[SIZE])
 
 
 def open_study(study_id: str, db: Path, sweep: Sweep) -> clients.Study:

@@ -13,10 +13,13 @@ from levanter.grug.sharding import compact_grug_mesh
 
 from experiments.grug.fast_track.model import GrugModelConfig
 from experiments.grug.looped.model import (
-    GatedRecurrentConfig,
-    GatedRecurrentTransformer,
+    GatedConfig,
+    GatedTransformer,
     LoopedModelConfig,
     LoopedTransformer,
+    PoolConfig,
+    PooledTransformer,
+    ScheduledTransformer,
     looped,
 )
 
@@ -108,39 +111,139 @@ def test_looped_forward_runs_one_stored_core_every_pass():
     np.testing.assert_allclose(_forward(model, tokens), reference, rtol=1e-5, atol=1e-5)
 
 
-def _gated_recurrent(keep_logit: float) -> GatedRecurrentTransformer:
-    """A Gated Recurrent Transformer whose gate keeps ``sigmoid(keep_logit)`` of every state coordinate."""
-    model = GatedRecurrentTransformer.init(
-        looped(BASE, config_type=GatedRecurrentConfig, **MIDDLE_CYCLE), key=jax.random.PRNGKey(0)
-    )
-    cell = model.cell
-    assert cell is not None
+def _gated(**fields) -> GatedTransformer:
+    cfg = looped(BASE, config_type=GatedConfig, **MIDDLE_CYCLE | fields)
+    return GatedTransformer.init(cfg, key=jax.random.PRNGKey(0))
+
+
+def _pooled(**fields) -> PooledTransformer:
+    cfg = looped(BASE, config_type=PoolConfig, **MIDDLE_CYCLE | fields)
+    return PooledTransformer.init(cfg, key=jax.random.PRNGKey(0))
+
+
+def _outer_block(model: ScheduledTransformer, position: int):
+    """The stored prelude or coda block at ``position``: the prelude blocks come first, then the coda's."""
+    return jax.tree.map(lambda leaf: leaf[position], model.stacked_blocks.stacked)
+
+
+def _prefix(model: ScheduledTransformer, tokens: jax.Array) -> jax.Array:
+    """The prelude output, one layer at a time."""
+    hidden = model.embed_gated_norm(model.embed_norm(model.token_embed[tokens]))
+    for i in range(model.config.prelude):
+        hidden = _run_layer(model, hidden, i, _outer_block(model, i))
+    return hidden
+
+
+def _core_output(model: ScheduledTransformer, hidden: jax.Array, p: int) -> jax.Array:
+    """The core run on ``hidden`` as pass ``p``, one layer at a time."""
+    layers = model.config.pass_layers(p)
+    for j, i in enumerate(range(layers.start, layers.stop)):
+        hidden = _run_layer(model, hidden, i, jax.tree.map(lambda leaf, j=j: leaf[j], model.core))
+    return hidden
+
+
+def _decoded(model: ScheduledTransformer, hidden: jax.Array) -> jax.Array:
+    """The coda and the final norms run on ``hidden``, one layer at a time."""
+    cfg = model.config
+    for k, i in enumerate(range(cfg.num_layers - cfg.coda, cfg.num_layers)):
+        hidden = _run_layer(model, hidden, i, _outer_block(model, cfg.prelude + k))
+    return model.final_gated_norm(model.final_norm(hidden))
+
+
+def _replaced_each_pass(model: GatedTransformer, tokens: jax.Array) -> jax.Array:
+    """A rung that replaces its state with the core's output each pass."""
+    hidden = _prefix(model, tokens)
+    for p in range(model.config.loops):
+        hidden = _core_output(model, hidden, p)
+    return _decoded(model, hidden)
+
+
+def _without_passes(model: ScheduledTransformer, tokens: jax.Array) -> jax.Array:
+    """The rung with its looped passes removed."""
+    return _decoded(model, _prefix(model, tokens))
+
+
+def _with_constant_gate(model: ScheduledTransformer, keep_logit: float) -> ScheduledTransformer:
+    """``model`` with a gate that keeps ``sigmoid(keep_logit)`` of every state coordinate, writing the rest."""
+    gate = model.gate
+    assert gate is not None
 
     # A zero output weight makes the gate its bias alone.
-    cell = dataclasses.replace(
-        cell, gate_out=jnp.zeros_like(cell.gate_out), gate_out_bias=jnp.full_like(cell.gate_out_bias, keep_logit)
+    gate = dataclasses.replace(
+        gate, gate_out=jnp.zeros_like(gate.gate_out), gate_out_bias=jnp.full_like(gate.gate_out_bias, keep_logit)
     )
-    return dataclasses.replace(model, cell=cell)
+    return dataclasses.replace(model, gate=gate)
 
 
-def test_gated_recurrent_cell_that_keeps_the_state_skips_the_loop():
-    model = _gated_recurrent(keep_logit=30.0)
+def test_gated_update_that_keeps_the_state_skips_the_loop():
+    model = _with_constant_gate(_gated(), keep_logit=30.0)
     tokens = _tokens()
 
-    reference = eqx.filter_jit(_prelude_and_coda)(model, tokens)
+    reference = eqx.filter_jit(_without_passes)(model, tokens)
     np.testing.assert_allclose(_forward(model, tokens), reference, rtol=1e-5, atol=1e-5)
 
 
-def test_gated_recurrent_cell_that_replaces_the_state_with_the_core_output_is_the_looped_model():
-    model = _gated_recurrent(keep_logit=-30.0)
+def test_gated_update_that_replaces_the_state_runs_the_core():
+    model = _with_constant_gate(_gated(), keep_logit=-30.0)
 
     # Project [state ; prelude] onto the state alone, so each pass runs the core on the state.
+    assert model.core_input is not None
     d = BASE.hidden_dim
     project = jnp.concatenate([jnp.eye(d), jnp.zeros((d, d))])
-    model = dataclasses.replace(model, cell=dataclasses.replace(model.cell, project=project))
-
-    fields = {field.name: getattr(model, field.name) for field in dataclasses.fields(LoopedTransformer)}
-    plain = LoopedTransformer(**fields | {"config": looped(BASE, **MIDDLE_CYCLE)})
+    model = dataclasses.replace(model, core_input=dataclasses.replace(model.core_input, project=project))
 
     tokens = _tokens()
-    np.testing.assert_allclose(_forward(model, tokens), _forward(plain, tokens), rtol=1e-5, atol=1e-5)
+    reference = eqx.filter_jit(_replaced_each_pass)(model, tokens)
+    np.testing.assert_allclose(_forward(model, tokens), reference, rtol=1e-5, atol=1e-5)
+
+
+def test_pool_that_takes_no_writes_skips_the_loop():
+    model = _with_constant_gate(_pooled(), keep_logit=30.0)
+    tokens = _tokens()
+
+    reference = eqx.filter_jit(_without_passes)(model, tokens)
+    np.testing.assert_allclose(_forward(model, tokens), reference, rtol=1e-5, atol=1e-5)
+
+
+def test_pooled_passes_add_their_changes_of_the_prelude_output():
+    model = _with_constant_gate(_pooled(), keep_logit=-30.0)
+    # Blind to the pool, every pass runs the core on the prelude output alone, so the pool sums the passes' changes.
+    assert model.read is not None
+    model = dataclasses.replace(model, read=dataclasses.replace(model.read, project=jnp.zeros_like(model.read.project)))
+    tokens = _tokens()
+
+    def expected(model: PooledTransformer, tokens: jax.Array) -> jax.Array:
+        prefix = _prefix(model, tokens)
+        changes = [_core_output(model, prefix, p) - prefix for p in range(model.config.loops)]
+        return _decoded(model, prefix + sum(changes))
+
+    np.testing.assert_allclose(_forward(model, tokens), eqx.filter_jit(expected)(model, tokens), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("build", [_gated, _pooled])
+def test_scheduled_rung_reads_no_later_token(build):
+    model = build(pass_starts=(0.0, 0.0, 0.5))
+    tokens = _tokens()
+    middle = SEQ_LEN // 2
+    changed = tokens.at[:, middle].set((tokens[:, middle] + 1) % BASE.vocab_size)
+
+    before, after = _forward(model, tokens), _forward(model, changed)
+    np.testing.assert_allclose(before[:, :middle], after[:, :middle], rtol=1e-5, atol=1e-5)
+    assert not np.allclose(before[:, middle:], after[:, middle:])
+
+
+@pytest.mark.parametrize("build", [_gated, _pooled])
+def test_growing_rung_trains_as_the_ungrown_rung_before_it_grows(build):
+    grown = build(pass_starts=(0.0, 0.0, 0.9))
+    plain = dataclasses.replace(grown, config=dataclasses.replace(grown.config, pass_starts=()))
+    tokens = _tokens()
+    weight = jnp.ones(tokens.shape)
+
+    def loss(model: ScheduledTransformer, progress: float) -> jax.Array:
+        return model.next_token_loss(tokens, weight, progress=jnp.asarray(progress))
+
+    early = eqx.filter_jit(loss)(grown, 0.5)
+    np.testing.assert_allclose(early, eqx.filter_jit(loss)(plain, 0.5), rtol=1e-6)
+
+    # In the last tenth of training, the extra pass changes the loss, if only slightly: the gate starts writing 2%.
+    assert eqx.filter_jit(loss)(grown, 0.95) != early

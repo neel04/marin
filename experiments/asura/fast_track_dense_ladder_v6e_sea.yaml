@@ -1,0 +1,23 @@
+# Fast Track dense ladder on public DCLM, on Spot v6e-16 in asia-southeast1: the reference setup in
+# docs/experiments/ledger.md, with its caches copied from europe-west4 to a bucket beside these TPUs. Every data step's
+# output is already built there, so a run starts training without touching the CPU VM.
+project: asura-0
+zone: asia-southeast1-b
+bucket: gs://marin-asura-0-asia-southeast1
+prefix: gs://marin-asura-0-asia-southeast1/fasttrack-public-20260926
+# Only for data steps whose outputs are missing, which none are; it lives in europe-west4.
+cpu_vm: marin-ft-cpu-20260928
+# Spot slice managed by experiments.asura.tpu_slice; its hosts are marin-ft-v6e16-sea-<4 chars>.
+tpu_vm: marin-ft-v6e16-sea
+accelerator: v6e-16
+tokenizer: dclm-bpe-v16384
+train_cache: gs://marin-asura-0-asia-southeast1/fasttrack-public-20260926/tokenized/fasttrack-dclm-bpe16k-shuf-20260928/train
+version: "2026.09.28"
+eval:
+  version: "2026.09.28"
+  # The raw text the WikiText cache was built from; never read while that cache exists.
+  wikitext_raw: gs://marin-asura-0-europe-west4/dclm-1p4b-2p8b/2026-09-25/eval/wikitext103-raw-v1-b08601e.jsonl
+  paloma_raw: raw/paloma-65cd6fc
+  uncheatable_commit: 185c463882a8ae0f203e51ae5852d8cf4fe299cf
+wandb_entity: neel
+wandb_project: marin

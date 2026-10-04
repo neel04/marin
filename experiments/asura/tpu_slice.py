@@ -94,20 +94,20 @@ def create(settings: GcpWorkerSettings, stop_at: datetime) -> None:
         f"--workload-policy=projects/{settings.project}/regions/{region}/resourcePolicies/{policy}",
     )
 
-    hosts = _wait_until_ready(settings, host_count)
+    hosts = wait_until_ready(settings, host_count, READY_TIMEOUT)
     print(f"{settings.tpu_vm} ready: {', '.join(hosts)}", flush=True)
 
 
-def _wait_until_ready(settings: GcpWorkerSettings, host_count: int) -> list[str]:
-    """The slice's hosts, once at least ``host_count`` of them run and accept SSH."""
-    deadline = time.monotonic() + READY_TIMEOUT
+def wait_until_ready(settings: GcpWorkerSettings, host_count: int, timeout: float) -> list[str]:
+    """The slice's hosts, once at least ``host_count`` of them run and accept SSH, within ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
     while True:
         hosts = tpu_hosts(settings)
         if len(hosts) >= host_count and all(_reachable(settings, host) for host in hosts):
             return hosts
 
         if time.monotonic() > deadline:
-            raise TimeoutError(f"{settings.tpu_vm} not ready after {READY_TIMEOUT}s; delete it to stop billing")
+            raise TimeoutError(f"{settings.tpu_vm} not ready after {timeout}s; delete it to stop billing")
         time.sleep(20)
 
 
@@ -115,7 +115,8 @@ def _reachable(settings: GcpWorkerSettings, host: str) -> bool:
     return subprocess.run([*ssh_command(settings, host), "--command=true"], capture_output=True).returncode == 0
 
 
-def setup(settings: GcpWorkerSettings) -> None:
+def setup(settings: GcpWorkerSettings, archive: Path) -> None:
+    """Install ``archive``, a checkout from ``archive_checkout``, with the credentials on every host."""
     hosts = tpu_hosts(settings)
     if not hosts:
         raise ValueError(f"No running hosts for {settings.tpu_vm}; run create first")
@@ -124,10 +125,7 @@ def setup(settings: GcpWorkerSettings) -> None:
         "~/.config/wandb/api-key": os.environ["WANDB_API_KEY"],
     }
     archive_uri = f"{settings.bucket}/tmp/ttl=1d/asura-source/{uuid.uuid4().hex}.tar.gz"
-    with tempfile.TemporaryDirectory() as tmp:
-        archive = Path(tmp) / "source.tar.gz"
-        _archive_checkout(archive)
-        subprocess.run(["gcloud", "storage", "cp", str(archive), archive_uri], check=True, capture_output=True)
+    subprocess.run(["gcloud", "storage", "cp", str(archive), archive_uri], check=True, capture_output=True)
 
     def install(host: str) -> None:
         ssh = ssh_command(settings, host)
@@ -147,7 +145,7 @@ def setup(settings: GcpWorkerSettings) -> None:
         list(pool.map(install, hosts))
 
 
-def _archive_checkout(archive: Path) -> None:
+def archive_checkout(archive: Path) -> None:
     """Tar the tracked and untracked, non-ignored files of this checkout, including uncommitted edits."""
     listing = subprocess.run(
         ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
@@ -185,11 +183,15 @@ def main() -> None:
     parser.add_argument("action", choices=("create", "setup", "delete"))
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--stop-at", type=datetime.fromisoformat, help="RFC 3339 time at which create's hosts stop")
+    parser.add_argument("--slice", help="Slice name, to run beside another queue; defaults to the config's tpu_vm")
     args = parser.parse_args()
-    settings = worker_settings(yaml.safe_load(args.config.read_text()))
+    settings = worker_settings(yaml.safe_load(args.config.read_text()), args.slice)
 
     if args.action == "setup":
-        setup(settings)
+        with tempfile.TemporaryDirectory() as tmp:
+            archive = Path(tmp) / "source.tar.gz"
+            archive_checkout(archive)
+            setup(settings, archive)
     elif args.action == "delete":
         delete(settings)
     elif args.stop_at is None or args.stop_at.tzinfo is None:

@@ -152,6 +152,10 @@ class GrugModelConfig:
     def model_type(self) -> type["Transformer"]:
         return Transformer
 
+    def extra_flops_per_token(self) -> float:
+        """Forward FLOPs per token beyond the ``num_layers`` layers and the output head the trainer prices."""
+        return 0.0
+
     @property
     def inferred_head_dim(self) -> int:
         if self.head_dim is not None:
@@ -902,7 +906,10 @@ class Transformer(eqx.Module):
         logsumexp_weight: float | None = None,
         loss_dtype: jnp.dtype = jnp.float32,
         return_router_metrics: bool = False,
+        progress: jax.Array | None = None,
     ) -> jax.Array | tuple[jax.Array, dict[str, jax.Array | SummaryStats]]:
+        """``progress`` is the fraction of training done, for models that change late in training; this one doesn't."""
+        del progress
         hidden, router_metrics = self(token_ids, mask=mask)
         labels = jnp.pad(token_ids[:, 1:], ((0, 0), (0, 1))).astype(jnp.int32)
         loss_weight = loss_weight.astype(loss_dtype)

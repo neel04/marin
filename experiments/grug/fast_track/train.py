@@ -8,11 +8,11 @@ import logging
 import os
 import time
 from collections.abc import Callable
-from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 
 import equinox as eqx
+import fsspec
 import jax
 import jax.numpy as jnp
 import jmp
@@ -30,6 +30,7 @@ from jax.tree_util import register_dataclass
 from jaxtyping import PRNGKeyArray
 from levanter.callbacks.state_adapter import StateCallbackRunner
 from levanter.callbacks.watch import WatchConfig, compute_watch_stats
+from levanter.checkpoint import Checkpointer
 from levanter.data.dataset import AsyncDataset
 from levanter.data.loader import DataLoader
 from levanter.data.mixture import MixtureDataset, rescale_mixture_schedule_for_batch_schedule
@@ -136,9 +137,9 @@ class GrugTrainerConfig:
     # This keeps one training executable resident. A diagnostic watch repeats forward and backward
     # in a separate executable, which costs compute but shortens gradient liveness.
     watch_mode: WatchMode = WatchMode.INLINE
-    # A short throughput gate leaves this off. A compute-optimal run needs it: the loop already
-    # restores from the latest committed checkpoint, so without a writer an interrupted run
-    # restarts at step 0.
+    # Whether to keep a permanent final checkpoint. Rolling temporary checkpoints are written either
+    # way, so a preempted run resumes from the latest one; without a permanent checkpoint they are
+    # deleted when the run finishes.
     save_checkpoints: bool = False
 
     # Grug builds its own compact (replica_dcn, data, expert, model) mesh instead of using
@@ -419,6 +420,7 @@ def _compute_flops(
     # The last layer is forced global even when depth is not a multiple of `global_every`; add the one
     # global layer the shared util misses (applies to both dense and MoE).
     flops_per_token += _forced_final_global_flops(model_config)
+    flops_per_token += model_config.extra_flops_per_token()
 
     flops_per_example = 3 * flops_per_token * model_config.max_seq_len
 
@@ -552,7 +554,7 @@ def _drop_metrics(
     }
 
 
-def _loss_and_grads(params, batch, mp: jmp.Policy, z_loss: float | None):
+def _loss_and_grads(params, batch, mp: jmp.Policy, z_loss: float | None, progress: jax.Array | None = None):
     def loss_fn(model):
         compute_params = mp.cast_to_compute(model)
         return compute_params.next_token_loss(
@@ -562,6 +564,7 @@ def _loss_and_grads(params, batch, mp: jmp.Policy, z_loss: float | None):
             reduction="mean",
             logsumexp_weight=z_loss,
             return_router_metrics=True,
+            progress=progress,
         )
 
     return jax.value_and_grad(loss_fn, has_aux=True)(params)
@@ -606,6 +609,7 @@ def _make_train_step(
     mp: jmp.Policy,
     *,
     z_loss_weight: float,
+    num_train_steps: int | None = None,
     ema_beta: float | None = None,
     watch_config: WatchConfig | None = None,
 ):
@@ -625,7 +629,9 @@ def _make_train_step(
         # host-side kernel launches that can cause SPMD sync issues).
         qb_params = _apply_qb_betas(state.params, state.pending_qb_betas)
 
-        (loss, summarized_metrics), grads = _loss_and_grads(qb_params, batch, mp, z_loss)
+        # Training progress in [0, 1], for models whose computation changes late in training.
+        progress = state.step / num_train_steps if num_train_steps else None
+        (loss, summarized_metrics), grads = _loss_and_grads(qb_params, batch, mp, z_loss, progress)
         metrics = {"train/loss": loss, **summarized_metrics}
         opt_state_in = state.opt_state
         if os.environ.get("GRUG_SKIP_OPTIMIZER"):
@@ -710,6 +716,7 @@ def _run_grug_local(config: GrugRunConfig) -> None:
         optimizer,
         trainer.mp,
         z_loss_weight=config.trainer.z_loss_weight,
+        num_train_steps=trainer.num_train_steps,
         watch_config=inline_watch_config,
     )
 
@@ -730,11 +737,8 @@ def _run_grug_local(config: GrugRunConfig) -> None:
     # in initialization, checkpoint restore, cache construction or compilation.
     progress_watchdog = trainer.progress_watchdog.create(process_index=jax.process_index())
 
-    checkpointer = trainer.checkpointer.create(run_id) if config.trainer.save_checkpoints else None
-    dashboard = (
-        TrainingDashboard(config, checkpointer.request_checkpoint, run_id) if checkpointer is not None else nullcontext()
-    )
-    with set_mesh(mesh), dashboard:
+    checkpointer = trainer.checkpointer.create(run_id)
+    with set_mesh(mesh), TrainingDashboard(config, checkpointer.request_checkpoint, run_id):
         batch_schedule = trainer.batch_schedule
 
         @jax.jit
@@ -974,13 +978,12 @@ def _run_grug_local(config: GrugRunConfig) -> None:
                     if watch_stats is not None:
                         levanter.tracker.log(watch_stats, step=step)
 
-                if checkpointer is not None:
-                    with callbacks.progress_event_scope(
-                        state_callbacks.emit_event,
-                        callbacks.ProgressEvent.CHECKPOINT_STARTED,
-                        callbacks.ProgressEvent.CHECKPOINT_FINISHED,
-                    ):
-                        checkpointer.on_step(tree=state, step=int(state.step))
+                with callbacks.progress_event_scope(
+                    state_callbacks.emit_event,
+                    callbacks.ProgressEvent.CHECKPOINT_STARTED,
+                    callbacks.ProgressEvent.CHECKPOINT_FINISHED,
+                ):
+                    checkpointer.on_step(tree=state, step=int(state.step))
 
         except BaseException:
             logger.exception(
@@ -990,7 +993,7 @@ def _run_grug_local(config: GrugRunConfig) -> None:
         else:
             # Mirror classic trainer behavior: force callbacks on the last completed step.
             state_callbacks.run(state, loss=last_loss, step_duration=last_step_duration, force=True)
-            if checkpointer is not None:
+            if config.trainer.save_checkpoints:
                 with callbacks.progress_event_scope(
                     state_callbacks.emit_event,
                     callbacks.ProgressEvent.CHECKPOINT_STARTED,
@@ -998,10 +1001,24 @@ def _run_grug_local(config: GrugRunConfig) -> None:
                 ):
                     checkpointer.on_step(tree=state, step=int(state.step), force=True)
                     checkpointer.wait_until_finished()
+            else:
+                checkpointer.wait_until_finished()
+                _delete_recovery_checkpoints(checkpointer)
         finally:
             state_callbacks.emit_event(callbacks.ProgressEvent.TRAINING_FINISHED)
 
     levanter.tracker.current_tracker().finish()
+
+
+def _delete_recovery_checkpoints(checkpointer: Checkpointer) -> None:
+    """Delete a finished run's temporary checkpoints, which only served to resume it after preemption."""
+    path = checkpointer.temporary_base_path
+    if path is None or jax.process_index() != 0:
+        return
+    fs, _, (plain_path,) = fsspec.get_fs_token_paths(path)
+    if fs.exists(plain_path):
+        logger.info("Deleting the finished run's recovery checkpoints at %s", path)
+        fs.rm(plain_path, recursive=True)
 
 
 def run_grug(config: GrugRunConfig) -> None:
