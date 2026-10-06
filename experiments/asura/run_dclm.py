@@ -12,6 +12,7 @@ import tempfile
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 import cloudpickle
@@ -61,6 +62,16 @@ class RunSettings:
     training: TrainingSettings
 
 
+class Provisioning(StrEnum):
+    """How GCE provisions a TPU slice's hosts."""
+
+    SPOT = "spot"
+    """Cheapest, but GCE can preempt the hosts at any time."""
+    FLEX_START = "flex_start"
+    """Dynamic Workload Scheduler flex-start: the hosts start when capacity frees up and are never preempted, at about
+    twice Spot's price."""
+
+
 @dataclass(frozen=True)
 class GcpWorkerSettings:
     project: str
@@ -72,6 +83,7 @@ class GcpWorkerSettings:
     """A single-host TPU VM, or a managed instance group whose hosts are named ``<tpu_vm>-<4 chars>``."""
     accelerator: str
     wandb_entity: str
+    provisioning: Provisioning = Provisioning.SPOT
 
 
 def load_settings(path: Path) -> RunSettings:

@@ -156,6 +156,14 @@ class GrugModelConfig:
         """Forward FLOPs per token beyond the ``num_layers`` layers and the output head the trainer prices."""
         return 0.0
 
+    def inference_depths(self) -> tuple[int, ...]:
+        """For a model whose depth can change at inference, further depths the final evaluation scores."""
+        return ()
+
+    def with_inference_depth(self, depth: int) -> "GrugModelConfig":
+        """This config at inference ``depth``, for models that list ``inference_depths``."""
+        raise ValueError(f"{type(self).__name__} has no inference depth to set")
+
     @property
     def inferred_head_dim(self) -> int:
         if self.head_dim is not None:
@@ -831,7 +839,11 @@ class Transformer(eqx.Module):
         self,
         token_ids: Int[Array, "B S"],
         mask: AttentionMask | jax.Array | None = None,
+        progress: jax.Array | None = None,
     ) -> tuple[Float[Array, "B S D"], dict[str, jax.Array]]:
+        """The final-normalized hidden states and the router metrics. ``progress`` is the fraction of training done,
+        for models that change late in training; this one doesn't."""
+        del progress
         if mask is None:
             mask = AttentionMask.causal()
 
@@ -908,9 +920,11 @@ class Transformer(eqx.Module):
         return_router_metrics: bool = False,
         progress: jax.Array | None = None,
     ) -> jax.Array | tuple[jax.Array, dict[str, jax.Array | SummaryStats]]:
-        """``progress`` is the fraction of training done, for models that change late in training; this one doesn't."""
-        del progress
-        hidden, router_metrics = self(token_ids, mask=mask)
+        """``progress`` is the fraction of training done, for models that change late in training."""
+        hidden, model_metrics = self(token_ids, mask=mask, progress=progress)
+        # Per-layer router statistics summarize below; a model's other metrics are scalars, logged as they are.
+        router_metrics = {key: value for key, value in model_metrics.items() if key.endswith("_per_layer")}
+        logged = {key: value for key, value in model_metrics.items() if not key.endswith("_per_layer")}
         labels = jnp.pad(token_ids[:, 1:], ((0, 0), (0, 1))).astype(jnp.int32)
         loss_weight = loss_weight.astype(loss_dtype)
 
@@ -932,9 +946,10 @@ class Transformer(eqx.Module):
         if return_router_metrics:
             if not router_metrics:
                 # Dense model: no router to summarize.
-                return loss, {"train/cross_entropy_loss": cross_entropy_loss}
+                return loss, {"train/cross_entropy_loss": cross_entropy_loss, **logged}
             summarized_metrics = summarize_router_metrics(router_metrics)
             summarized_metrics["train/cross_entropy_loss"] = cross_entropy_loss
+            summarized_metrics.update(logged)
             num_moe_layers = router_metrics["router_z_loss_per_layer"].shape[0]
             summarized_metrics["train/router/z_loss_logging_only"] = (
                 jnp.sum(router_metrics["router_z_loss_per_layer"]) / num_moe_layers

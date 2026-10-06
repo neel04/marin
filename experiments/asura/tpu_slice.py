@@ -26,7 +26,7 @@ from pathlib import Path
 
 import yaml
 
-from experiments.asura.run_dclm import GcpWorkerSettings, ssh_command, tpu_hosts
+from experiments.asura.run_dclm import GcpWorkerSettings, Provisioning, ssh_command, tpu_hosts
 from experiments.asura.run_fast_track import worker_settings
 
 # Accelerator -> (machine type, accelerator topology, hosts).
@@ -36,7 +36,11 @@ SLICES = {
 }
 IMAGE_FAMILY = "ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e"
 IMAGE_PROJECT = "ubuntu-os-accelerator-images"
-READY_TIMEOUT = 30 * 60
+# How long a new slice may take to come up. Pending flex-start hosts cost nothing, and a recreated slice loses its place
+# in the Dynamic Workload Scheduler's queue, so flex-start waits longer.
+READY_TIMEOUT = {Provisioning.SPOT: 10 * 60, Provisioning.FLEX_START: 90 * 60}
+DELETE_ATTEMPTS = 3
+DELETE_RETRY_WAIT = 30
 REPO = Path(__file__).resolve().parents[2]
 WATCHDOG = Path(__file__).with_name("slice_watchdog.sh")
 CLUSTER_CONFIG = Path.home() / ".config/marin/clusters/asura.yaml"
@@ -66,15 +70,26 @@ def create(settings: GcpWorkerSettings, stop_at: datetime) -> None:
         f"--accelerator-topology={topology}",
     )
 
-    # Spot templates in a managed instance group must stop, not delete, on preemption, and cannot carry a GCE
-    # termination time, so the watchdog stops each host. The do-nothing failure policy keeps stopped hosts stopped.
+    if settings.provisioning == Provisioning.FLEX_START:
+        # Flex-start hosts are never preempted, and GCE deletes them when their run reaches the stop time.
+        max_run = int((stop_at - datetime.now(UTC)).total_seconds())
+        provisioning = (
+            "--provisioning-model=FLEX_START",
+            "--instance-termination-action=DELETE",
+            f"--max-run-duration={max_run}s",
+        )
+    else:
+        # Spot templates in a managed instance group must stop, not delete, on preemption, and cannot carry a GCE
+        # termination time, so the watchdog stops each host. The do-nothing failure policy keeps stopped hosts stopped.
+        provisioning = ("--provisioning-model=SPOT", "--instance-termination-action=STOP")
+
+    # Either way, the watchdog also stops a host that sits idle.
     gcloud(
         settings,
         *("alpha", "compute", "instance-templates", "create", template),
         f"--machine-type={machine_type}",
         "--maintenance-policy=TERMINATE",
-        "--provisioning-model=SPOT",
-        "--instance-termination-action=STOP",
+        *provisioning,
         f"--metadata=stop-at={stop_at.isoformat()}",
         f"--metadata-from-file=startup-script={WATCHDOG}",
         f"--image-family={IMAGE_FAMILY}",
@@ -94,7 +109,7 @@ def create(settings: GcpWorkerSettings, stop_at: datetime) -> None:
         f"--workload-policy=projects/{settings.project}/regions/{region}/resourcePolicies/{policy}",
     )
 
-    hosts = wait_until_ready(settings, host_count, READY_TIMEOUT)
+    hosts = wait_until_ready(settings, host_count, READY_TIMEOUT[settings.provisioning])
     print(f"{settings.tpu_vm} ready: {', '.join(hosts)}", flush=True)
 
 
@@ -172,10 +187,14 @@ def delete(settings: GcpWorkerSettings) -> None:
 
     for deletion in deletions:
         command = ["gcloud", "compute", *deletion, f"--project={settings.project}", "--quiet"]
-        result = subprocess.run(command, capture_output=True, text=True)
-
-        if result.returncode != 0 and "was not found" not in result.stderr:
-            raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
+        # A lost connection, or an instance group still settling after a preemption, fails a delete for a while.
+        for attempt in range(1, DELETE_ATTEMPTS + 1):
+            result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode == 0 or "was not found" in result.stderr:
+                break
+            if attempt == DELETE_ATTEMPTS:
+                raise subprocess.CalledProcessError(result.returncode, command, result.stdout, result.stderr)
+            time.sleep(DELETE_RETRY_WAIT)
 
 
 def main() -> None:

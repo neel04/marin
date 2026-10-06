@@ -22,7 +22,7 @@ from marin.datakit.download.uncheatable_eval import UncheatableEvalDownloadConfi
 from marin.execution.lazy import ArtifactStep, resolve
 from marin.experiment.data import raw_download, tokenized
 
-from experiments.asura.run_dclm import GcpSshClient, GcpWorkerSettings
+from experiments.asura.run_dclm import GcpSshClient, GcpWorkerSettings, Provisioning
 from experiments.datasets.paloma import paloma_datasets
 from experiments.datasets.uncheatable import UNCHEATABLE_SUBSETS
 from experiments.grug.fast_track.launch import H100_LADDER_SIZES, build_h100_ladder_run
@@ -116,6 +116,7 @@ def worker_settings(config: dict, slice_name: str | None = None) -> GcpWorkerSet
         tpu_vm=slice_name or config["tpu_vm"],
         accelerator=config["accelerator"],
         wandb_entity=config["wandb_entity"],
+        provisioning=Provisioning(config.get("provisioning", Provisioning.SPOT)),
     )
 
 

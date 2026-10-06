@@ -359,6 +359,10 @@ def _forced_final_global_flops(cfg: GrugModelConfig) -> float:
     return (qkv(global_kv) + attn(seq)) - (qkv(local_kv) + attn(sw))
 
 
+def _at_inference_depth(model: Transformer, depth: int) -> Transformer:
+    return dataclasses.replace(model, config=model.config.with_inference_depth(depth))
+
+
 def _compute_flops(
     *,
     model_config: GrugModelConfig,
@@ -913,6 +917,22 @@ def _run_grug_local(config: GrugRunConfig) -> None:
                 for hook in eval_hooks:
                     state_callbacks.add_hook(hook, every=interval)
 
+            # A model whose depth can change at inference is also scored at further depths, once, at the end.
+            for depth in config.model.inference_depths():
+                depth_evaluator = build_tagged_evaluator(
+                    data_config=config.data,
+                    max_seq_len=config.model.max_seq_len,
+                    mesh=mesh,
+                    eval_cfg=eval_cfg,
+                    mp=trainer.mp,
+                    model_transform=functools.partial(_at_inference_depth, depth=depth),
+                )
+                if depth_evaluator is not None:
+                    depth_eval = cb_tagged_evaluate(
+                        depth_evaluator, prefix=f"eval_pass{depth}", eval_current=True, eval_ema=False
+                    )
+                    state_callbacks.add_hook(depth_eval, every=stop_step)
+
         last_loss: float | jax.Array = 0.0
         last_step_duration = 0.0
 
@@ -963,6 +983,10 @@ def _run_grug_local(config: GrugRunConfig) -> None:
                             {"train/cross_entropy_loss": metrics["train/cross_entropy_loss"]},
                             step=step,
                         )
+                    # A looped model's per-pass scalars, such as its fast weights' scales.
+                    pass_metrics = {key: value for key, value in metrics.items() if key.startswith("train/fast/")}
+                    if pass_metrics:
+                        levanter.tracker.log(pass_metrics, step=step)
                     if "moe/dropped_assignments" in metrics:
                         drop_metrics = _drop_metrics(
                             metrics["moe/dropped_assignments"],

@@ -3,10 +3,12 @@
 
 """Where Spot TPUs are cheapest for asura-0 right now, and whether a slice can actually run there.
 
-For v5p and v6e in every region the price list covers, prints the Spot price per chip-hour, the zones that offer the
-machine type, the region's preemptible and per-family quota, and whether the Fast Track caches are in that region's
-bucket, for the regions where some zone offers the machine: the price list and the quota table also cover regions
-where none does. A family that the per-family quota caps, such as v6e, is blocked in every region it does not list.
+For v5p and v6e in every region the price list covers, prints the cost of one d768 run, the Spot price per chip-hour,
+the zones that offer the machine type, the region's preemptible and per-family quota, and whether the Fast Track
+caches are in that region's bucket, for the regions where some zone offers the machine: the price list and the quota
+table also cover regions where none does. A family that the per-family quota caps, such as v6e, is blocked in every
+region it does not list. Rows are ranked by the cost of a run, not of a chip-hour: a v5p-32 trains d768 about twice as
+fast as a v6e-16 of the same chip count, so it is often cheaper per run at a higher hourly price.
 
     uv run python -m experiments.asura.tpu_regions
 """
@@ -22,6 +24,8 @@ PROJECT = "asura-0"
 COMPUTE_SKUS = "https://cloudbilling.googleapis.com/v1/services/6F81-5844-456A/skus"
 CACHE = "fasttrack-public-20260926/tokenized/fasttrack-dclm-bpe16k-shuf-20260928/train"
 SLICE_CHIPS = 16
+# Controller wall time of one data-matched d768 run, compile and evaluation included, on a v5p-32 and on a v6e-16.
+D768_RUN_MINUTES = {"v5p": 9, "v6e": 16}
 
 
 @dataclass(frozen=True)
@@ -124,15 +128,18 @@ def main() -> None:
             preemptible_limit = preemptible.get(region, preemptible.get("*", 0.0))
             family_limit = None if family is None else family.get(region, 0.0)
             usable = preemptible_limit >= SLICE_CHIPS and (family_limit is None or family_limit >= SLICE_CHIPS)
-            rows.append((price, generation.name, region, region_zones, preemptible_limit, family_limit, usable))
+            per_run = price * SLICE_CHIPS * D768_RUN_MINUTES[generation.name] / 60
+            rows.append((per_run, price, generation.name, region, region_zones, preemptible_limit, family_limit, usable))
 
-    print(f"{'$/chip-h':>9}  {'TPU':4} {'region':16} {'zones':40} {'preempt':>8} {'family':>7}  usable  data")
-    for price, name, region, region_zones, preemptible_limit, family_limit, usable in sorted(rows):
+    print(
+        f"{'$/run':>6}  {'$/chip-h':>9}  {'TPU':4} {'region':16} {'zones':40} {'preempt':>8} {'family':>7}  usable  data"
+    )
+    for per_run, price, name, region, region_zones, preemptible_limit, family_limit, usable in sorted(rows):
         family_text = "-" if family_limit is None else f"{family_limit:.0f}"
         data = "yes" if has_cache(region) else ""
         print(
-            f"{price:9.4f}  {name:4} {region:16} {','.join(sorted(region_zones)):40} {preemptible_limit:8.0f}"
-            f" {family_text:>7}  {'yes' if usable else '':6}  {data}"
+            f"{per_run:6.2f}  {price:9.4f}  {name:4} {region:16} {','.join(sorted(region_zones)):40}"
+            f" {preemptible_limit:8.0f} {family_text:>7}  {'yes' if usable else '':6}  {data}"
         )
 
 

@@ -7,11 +7,16 @@ The queue estimates how long its runs take, pads the estimate, and creates the s
 reprovisions the slice when a preemption leaves hosts missing, retries each run, skips runs that could not
 finish before the stop time, and deletes the slice at the end.
 
+Given several configs, cheapest per run first (``experiments.asura.tpu_regions`` ranks them), the queue starts in the
+first, and when a slice there gets no hosts within its readiness timeout (10 minutes for Spot) it moves to the next,
+wrapping around to the first after the last. Each run's id names the accelerator it trained on.
+
 The queue snapshots this checkout when it starts. Every slice setup installs the snapshot, and each run's controller
 builds its configuration from the snapshot's ``experiments``, so edits made while the queue runs reach none of its
 runs. The controller still imports the libraries under ``lib/`` from the live checkout.
 
-    uv run python -m experiments.asura.tpu_queue --config <config.yaml> --size d768 --variant <name> ...
+    uv run python -m experiments.asura.tpu_queue --config <cheapest.yaml> [--config <next.yaml> ...] --size d768 \
+        --variant <name> ...
 """
 
 import argparse
@@ -22,14 +27,15 @@ import sys
 import tarfile
 import tempfile
 import time
+from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import yaml
 
-from experiments.asura.run_dclm import GcpWorkerSettings, tpu_hosts
+from experiments.asura.run_dclm import GcpWorkerSettings, Provisioning, tpu_hosts
 from experiments.asura.run_fast_track import worker_settings
 from experiments.asura.tpu_slice import SLICES, archive_checkout, create, delete, setup, wait_until_ready
 from experiments.grug.looped.model import VARIANTS
@@ -38,8 +44,8 @@ logger = logging.getLogger(__name__)
 
 # Measured controller wall time of one data-matched rung on v5p-32, including compile and eval.
 RUN_MINUTES = {"d768": 9, "d1024": 30}
-# Slice creation and setup, including a short wait for Spot capacity.
-PROVISION_MINUTES = 10
+# Slice creation and setup in one region, including the wait for capacity: up to the slice's readiness timeout.
+PROVISION_MINUTES = {Provisioning.SPOT: 10, Provisioning.FLEX_START: 90}
 
 # The slice stops at PADDING times the queue's estimated length; a single run stops at RUN_TIMEOUT_FACTOR times its own.
 PADDING = 1.5
@@ -48,6 +54,8 @@ ATTEMPTS = 3
 # A host the instance group restarts, after a preemption or a host error, runs before it accepts SSH again; this long
 # for it to boot before the slice is replaced. Its disk, and the setup on it, survive the restart.
 RESTART_GRACE = timedelta(minutes=5)
+# Between failed provisionings, which cost no training attempt.
+PROVISION_RETRY_WAIT = timedelta(minutes=1)
 
 DENSE = "dense"
 
@@ -55,56 +63,80 @@ DENSE = "dense"
 @dataclass(frozen=True)
 class Run:
     run_id: str
+    """An ``{accelerator}`` in it becomes the accelerator of the region the run trains in."""
     args: tuple[str, ...] = ()
     """Extra ``run_fast_track`` arguments."""
 
+    def on(self, accelerator: str) -> "Run":
+        return replace(self, run_id=self.run_id.format(accelerator=accelerator.replace("-", "")))
+
+
+@dataclass(frozen=True)
+class _Placement:
+    """A region the queue can run in: its slice's settings, and the controller command that trains there."""
+
+    settings: GcpWorkerSettings
+    launch: list[str]
+
 
 def run_queue(
-    config: Path, size: str, runs: Sequence[Run], run_minutes: float, slice_name: str | None = None
+    configs: Sequence[Path], size: str, runs: Sequence[Run], run_minutes: float, slice_name: str | None = None
 ) -> list[Run]:
     """Train ``runs`` in order on a fresh slice and return the ones that finished.
 
+    ``configs`` are the regions to run in, cheapest first: the queue moves to the next when one gets no hosts.
     ``run_minutes`` is one run's expected controller wall time, which sets each run's timeout and the slice's stop time.
-    ``slice_name`` replaces the config's ``tpu_vm``, so that two queues can run side by side on separate slices.
+    ``slice_name`` replaces each config's ``tpu_vm``, so that two queues can run side by side on separate slices.
     """
-    settings = worker_settings(yaml.safe_load(config.read_text()), slice_name)
+    settings = [worker_settings(yaml.safe_load(config.read_text()), slice_name) for config in configs]
     run_time = timedelta(minutes=run_minutes)
-    stop_at = datetime.now(UTC) + PADDING * (timedelta(minutes=PROVISION_MINUTES) + len(runs) * run_time)
+    # Time to try every region once, then to train every run.
+    provision_time = sum((timedelta(minutes=PROVISION_MINUTES[s.provisioning]) for s in settings), timedelta())
+    stop_at = datetime.now(UTC) + PADDING * (provision_time + len(runs) * run_time)
     logger.info("Queue of %d %s runs; the slice stops at %s", len(runs), size, stop_at.isoformat())
 
     finished = []
     with tempfile.TemporaryDirectory() as tmp:
-        snapshot = _Snapshot.take(Path(tmp), config)
-        launch = [
-            sys.executable,
-            "-m",
-            "experiments.asura.run_fast_track",
-            f"--config={snapshot.config}",
-            f"--size={size}",
-        ]
-        if slice_name:
-            launch.append(f"--slice={slice_name}")
+        snapshot = _Snapshot.take(Path(tmp), configs)
+        launches = [_launch(config, size, slice_name) for config in snapshot.configs]
+        # The region the queue runs in now comes first.
+        regions = deque(_Placement(s, launch) for s, launch in zip(settings, launches, strict=True))
         try:
             for run in runs:
-                if _train_with_retries(run, launch, snapshot, settings, run_time, stop_at):
+                if _train_with_retries(run, snapshot, regions, run_time, stop_at):
                     finished.append(run)
         finally:
-            delete(settings)
+            for placement in regions:
+                delete(placement.settings)
 
     return finished
 
 
+def _launch(config: Path, size: str, slice_name: str | None) -> list[str]:
+    launch = [sys.executable, "-m", "experiments.asura.run_fast_track", f"--config={config}", f"--size={size}"]
+    if slice_name:
+        launch.append(f"--slice={slice_name}")
+    return launch
+
+
+def _move_on(regions: deque[_Placement]) -> None:
+    """Give up on the current region's slice and run in the next, wrapping around after the last."""
+    delete(regions[0].settings)
+    regions.rotate(-1)
+    logger.info("Trying %s (%s)", regions[0].settings.zone, regions[0].settings.accelerator)
+
+
 @dataclass(frozen=True)
 class _Snapshot:
-    """This checkout as the queue started: an archive for the hosts, its extraction for the controller, and a copy of
-    the queue's config, which the controller reads by its absolute path, wherever the original lives."""
+    """This checkout as the queue started: an archive for the hosts, its extraction for the controller, and copies of
+    the queue's configs, which the controller reads by their absolute paths, wherever the originals live."""
 
     archive: Path
     root: Path
-    config: Path
+    configs: tuple[Path, ...]
 
     @staticmethod
-    def take(directory: Path, config: Path) -> "_Snapshot":
+    def take(directory: Path, configs: Sequence[Path]) -> "_Snapshot":
         archive = directory / "source.tar.gz"
         archive_checkout(archive)
 
@@ -112,9 +144,12 @@ class _Snapshot:
         with tarfile.open(archive) as tar:
             tar.extractall(root, filter=_extracted_now)
 
-        copied = directory / "queue-config.yaml"
-        shutil.copyfile(config, copied)
-        return _Snapshot(archive, root, copied.resolve())
+        copies = []
+        for index, config in enumerate(configs):
+            copied = directory / f"queue-config-{index}.yaml"
+            shutil.copyfile(config, copied)
+            copies.append(copied.resolve())
+        return _Snapshot(archive, root, tuple(copies))
 
 
 def _extracted_now(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo:
@@ -124,26 +159,29 @@ def _extracted_now(member: tarfile.TarInfo, destination: str) -> tarfile.TarInfo
 
 
 def _train_with_retries(
-    run: Run,
-    launch: list[str],
-    snapshot: _Snapshot,
-    settings: GcpWorkerSettings,
-    run_time: timedelta,
-    stop_at: datetime,
+    run: Run, snapshot: _Snapshot, regions: deque[_Placement], run_time: timedelta, stop_at: datetime
 ) -> bool:
-    """Whether ``run`` finished within ``ATTEMPTS`` attempts that each fit before the slice stops."""
-    for attempt in range(1, ATTEMPTS + 1):
+    """Whether ``run`` finished within ``ATTEMPTS`` training attempts that each fit before the slice stops. A failed
+    provisioning costs no attempt and moves the queue to the next region: Spot capacity and networks come and go, and
+    the stop time bounds the wait."""
+    attempt = 0
+    while attempt < ATTEMPTS:
+        placement = regions[0]
+        placed = run.on(placement.settings.accelerator)
         if datetime.now(UTC) + run_time > stop_at:
-            logger.warning("Skipping %s: it would not finish before the slice stops", run.run_id)
+            logger.warning("Skipping %s: it would not finish before the slice stops", placed.run_id)
             return False
 
-        logger.info("%s: attempt %d", run.run_id, attempt)
-        if not _ensure_slice(settings, snapshot, stop_at):
+        if not _ensure_slice(placement.settings, snapshot, stop_at):
+            _move_on(regions)
+            time.sleep(PROVISION_RETRY_WAIT.total_seconds())
             continue
 
+        attempt += 1
+        logger.info("%s: attempt %d", placed.run_id, attempt)
         # A lost connection hangs the controller, so stop a run at twice its usual time or at the stop time.
         timeout = min(RUN_TIMEOUT_FACTOR * run_time, stop_at - datetime.now(UTC))
-        if _train(run, launch, snapshot, timeout):
+        if _train(placed, placement.launch, snapshot, timeout):
             return True
 
     return False
@@ -162,7 +200,7 @@ def _ensure_slice(settings: GcpWorkerSettings, snapshot: _Snapshot, stop_at: dat
         create(settings, stop_at)
         setup(settings, snapshot.archive)
     except (subprocess.CalledProcessError, TimeoutError):
-        # Spot capacity and networks come and go; a failed provisioning costs one attempt.
+        # Spot capacity and networks come and go: the queue tries the next region.
         logger.exception("Provisioning failed")
         return False
 
@@ -195,12 +233,10 @@ def _train(run: Run, launch: list[str], snapshot: _Snapshot, timeout: timedelta)
         return False
 
 
-def _variant_run(
-    variant: str, size: str, accelerator: str, date: str, tag: str, seed: int, extra_args: tuple[str, ...]
-) -> Run:
+def _variant_run(variant: str, size: str, date: str, tag: str, seed: int, extra_args: tuple[str, ...]) -> Run:
     # Seed 0 keeps the untagged run id, as in tune_fast_track.
     name = "-".join(part for part in (variant, tag, f"s{seed}" if seed else "") if part)
-    run_id = f"fasttrack-{name}-{size}-dclmbpe-{accelerator}-{date}"
+    run_id = f"fasttrack-{name}-{size}-dclmbpe-{{accelerator}}-{date}"
     extra_args = (*extra_args, f"--seed={seed}")
     if variant == DENSE:
         return Run(run_id, extra_args)
@@ -210,7 +246,13 @@ def _variant_run(
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, required=True)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        action="append",
+        required=True,
+        help="A region to run in; repeat it, cheapest per run first, to move on when one gets no hosts",
+    )
     parser.add_argument("--size", required=True, choices=sorted(RUN_MINUTES))
     parser.add_argument(
         "--variant", action="append", required=True, choices=[DENSE, *sorted(VARIANTS)], help=f"{DENSE}: the reference"
@@ -230,14 +272,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    accelerator = worker_settings(yaml.safe_load(args.config.read_text())).accelerator.replace("-", "")
     extra_args = (f"--optimizer-trial={args.optimizer_trial}",) if args.optimizer_trial else ()
     if args.save_checkpoints:
         extra_args = (*extra_args, "--save-checkpoints")
-    runs = [
-        _variant_run(variant, args.size, accelerator, args.date, args.tag, args.seed, extra_args)
-        for variant in args.variant
-    ]
+    runs = [_variant_run(variant, args.size, args.date, args.tag, args.seed, extra_args) for variant in args.variant]
 
     run_minutes = args.run_minutes or RUN_MINUTES[args.size]
     finished = run_queue(args.config, args.size, runs, run_minutes, args.slice)

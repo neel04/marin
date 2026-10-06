@@ -105,7 +105,7 @@ class Sweep:
     def train_unfinished(self, runs: list[Run]) -> None:
         """Train, as one TPU queue, the runs that have not finished in W&B."""
         unfinished = [run for run in runs if self.final_loss(run.run_id) is None]
-        run_queue(self.config, SIZE, unfinished, RUN_MINUTES[SIZE])
+        run_queue([self.config], SIZE, unfinished, RUN_MINUTES[SIZE])
 
 
 def open_study(study_id: str, db: Path, sweep: Sweep) -> clients.Study:

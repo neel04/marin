@@ -15,7 +15,8 @@ Wall time is the W&B run duration. It excludes slice provisioning and worker set
 | d768 | reference ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-dense-d768-dclmbpe-v5p32-20260928)) | 1.07B | 3.2548 | 1.3275 | 1.1478 | 4.25M | 33.9% | 6.0 min |
 | d768 | reference, tuned optimizer‡ ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-tune20261001-t022-d768-dclmbpe-v5p32)) | 1.07B | 3.2431 | 1.3230 | 1.1444 | 4.28M | 34.1% | 5.9 min |
 | d768 | looped, `mid2-grt-grow`§ ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-mid2-grt-grow-t26-d768-dclmbpe-v5p32-20261003r4)) | 1.07B | 3.2287 | 1.3169 | 1.1396 | 3.94M | 33.7% | 6.9 min |
-| d768 | best, gated middle block, `mid4-grt-grow`§ ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-mid4-grt-grow-t26-d768-dclmbpe-v5p32-20261003r13)) | 1.07B | 3.2150 | 1.3111 | 1.1296 | 3.96M | 34.0% | 6.8 min |
+| d768 | gated middle block, `mid4-grt-grow`§ ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-mid4-grt-grow-t26-d768-dclmbpe-v5p32-20261003r13)) | 1.07B | 3.2150 | 1.3111 | 1.1296 | 3.96M | 34.0% | 6.8 min |
+| d768 | best, pooled middle block grown four times, `mid4-pool-grow4`§¶ ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-mid4-pool-grow4-t26-d768-dclmbpe-v6e16-20261005)) | 1.07B | 3.1799 | 1.2973 | 1.1146 | 1.16M | 6.8% | 13.1 min |
 | d1024 | reference ([W&B](https://wandb.ai/neel/marin/runs/fasttrack-dense-d1024-dclmbpe-v5p32-20260928)) | 2.89B | 2.9897 | 1.2219 | 1.0193 | 2.11M | 38.6% | 25.2 min |
 
 ‡The tuned-optimizer row is the best of a 28-trial [Vizier](https://github.com/google/vizier) sweep (GP-UCB-PE,
@@ -164,6 +165,47 @@ a shared core, `mid2-pool` loses 0.0085 to `mid2-grt` (3.2411 against 3.2326), a
 after the coda, which then runs every pass, scores 3.2383 at 1.29x the FLOPs; two strings on the shared core score
 3.2345 sharing one pool and 3.2311 with a pool each, at 1.52x and 1.54x. Only the pool before the coda, with one string,
 stays in the code.
+
+¶The growth runs trained on a v6e-16 slice, so their tokens/s and MFU are not comparable with the v5p rows above; the
+same `mid4-pool-grow` on v6e-16 scores 3.2122 against 3.2127 on v5p, so their losses are. Growth trains more passes
+than the reference executes and evaluation runs every one of them, so these rungs cost more at inference than in
+training:
+
+| Pooled middle block, its passes from the start of training | Paloma loss | Training FLOPs | Inference FLOPs |
+|-------|------------:|------:|------:|
+| one, a second from 90%: `mid4-pool-grow` | 3.2122 | 1.070x | 1.48x |
+| one, more from 80% and 90%: `mid4-pool-grow2` | 3.2024 | 1.160x | 1.93x |
+| one, more from 70%, 80% and 90%: `mid4-pool-grow3` | 3.1882 | 1.296x | 2.39x |
+| one, more from 60%, 70%, 80% and 90%: `mid4-pool-grow4` | **3.1799** | 1.478x | 2.84x |
+
+Every pass added late in training lowers the loss, by 0.010, 0.014 and 0.008. The rung is tuned to its trained depth:
+`mid4-pool-grow3` scores 3.7550 after one pass, 3.2235 after three, 3.1882 after its four and 3.2696 after six, so the
+extra inference compute must be trained for.
+
+Training compute beyond about 1.2x the reference's is out of scope, which makes `mid4-pool-grow2` the best rung within
+the cap. Within it, only the pool also programming each core block's MLP gains: a rank-32 change of the MLP's gate and
+up projections for each token and pass (`mid4-pool-grow2-fast`, 1.172x) scores 3.1972, 0.005 under `mid4-pool-grow2`
+at every depth of its curve, about one seed's standard deviation. Its scales change by 20 to 43% from one pass to the
+next, so the passes do run different weights. Each from one seed, everything else lost or tied:
+- **Ablating the pooled pass** loses or ties: a learned pass embedding in place of the pool's read (−0.019), a gate per
+  channel, the core's output written in place of its change, the core anchored on the pool. Fast weights without the
+  pool's additive read score 3.2270.
+- **Other ways to spend the cap** lose. More, later passes score 3.2036 and 3.2110, and passes over the middle two blocks
+  alone 3.2307. A grown pass trained alone on the detached earlier passes scores 3.2336 on `mid4-pool-grow4`'s
+  schedule, and interleaving such steps with end-to-end ones 3.2278: the third pass learns to change nothing.
+- **Telling the passes apart** gains nothing. That covers random-depth training as deep-thinking networks do
+  (arXiv 2202.05826, 3.2120; with a loss after every pass the run diverges unless grown passes' writes start from
+  zero), a FiLM of the pass's place (3.2260, a flat depth curve) and attention over the pass
+  history as Attention Residuals mixes layers (arXiv 2603.15031, −0.0065). It also covers each core block reading the
+  earlier passes' keys and values through a delta-rule memory or softmax attention, on either stack (3.2026 against
+  3.2024 on `mid4-pool-grow2`).
+- **A Gated DeltaNet core** in place of attention (arXiv 2412.06464) scores 3.2040 grown three times at 1.177x. That is
+  level with `mid4-pool-grow2` per FLOP, but it trains at a third of attention's rate on v6e.
+- **Refining the fast weights** ties. Rank 64 scores 3.1961, programming the coda too 3.1993, all seven projections
+  3.2012, a recurrent state or a small network setting the scales 3.1967 and 3.1962, and directions per pass 3.2023.
+- **A bounded recurrence over the passes** extrapolates better without scoring better. The pool decaying by a gate of its
+  own before each write (`A <- decay * A + write * delta`) scores 3.2008 against 3.2024. It loses less past its trained
+  depth: 3.384 after six passes, against 3.434. The softmax read of the earlier passes does the same, 3.401 after six.
 
 Every readout that reads other positions sees only its own document, as the model's attention does: training and
 evaluation sequences pack several documents. A first version of the cache read earlier documents too and scored

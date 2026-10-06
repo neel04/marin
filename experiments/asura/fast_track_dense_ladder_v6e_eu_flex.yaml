@@ -1,0 +1,22 @@
+# Fast Track dense ladder on public DCLM, on flex-start v6e-16 in europe-west4-a, which GCE never preempts: the
+# reference setup in docs/experiments/ledger.md, beside its caches.
+project: asura-0
+zone: europe-west4-a
+bucket: gs://marin-asura-0-europe-west4
+prefix: gs://marin-asura-0-europe-west4/fasttrack-public-20260926
+# Runs any CPU step whose output is not already built.
+cpu_vm: marin-ft-cpu-20260928
+# Flex-start slice managed by experiments.asura.tpu_slice; its hosts are marin-ft-v6e16-eu-<4 chars>.
+tpu_vm: marin-ft-v6e16-eu
+accelerator: v6e-16
+tokenizer: dclm-bpe-v16384
+train_cache: gs://marin-asura-0-europe-west4/fasttrack-public-20260926/tokenized/fasttrack-dclm-bpe16k-shuf-20260928/train
+version: "2026.09.28"
+eval:
+  version: "2026.09.28"
+  wikitext_raw: gs://marin-asura-0-europe-west4/dclm-1p4b-2p8b/2026-09-25/eval/wikitext103-raw-v1-b08601e.jsonl
+  paloma_raw: raw/paloma-65cd6fc
+  uncheatable_commit: 185c463882a8ae0f203e51ae5852d8cf4fe299cf
+wandb_entity: neel
+wandb_project: marin
+provisioning: flex_start
